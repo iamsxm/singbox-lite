@@ -3469,6 +3469,15 @@ _view_nodes() {
         [ -n "$url" ] && echo -e "  ${YELLOW}分享链接:${NC} ${url}"
         # 收集链接到临时文件
         [ -n "$url" ] && echo "$url" >> /tmp/singbox_links.tmp
+
+        # 同步打印 mihomo / Clash.Meta 单行节点 (从 clash.yaml 抽取对应 proxy 转 JSON)
+        if [ -n "$proxy_name_to_find" ] && [ -f "$YQ_BINARY" ] && [ -f "$CLASH_YAML_FILE" ]; then
+            export PROXY_NAME="$proxy_name_to_find"
+            local proxy_json_line=$(${YQ_BINARY} eval -o=json '.proxies[] | select(.name == env(PROXY_NAME))' "$CLASH_YAML_FILE" 2>/dev/null | jq -c . 2>/dev/null)
+            if [ -n "$proxy_json_line" ] && [ "$proxy_json_line" != "null" ]; then
+                echo -e "  ${YELLOW}mihomo:${NC} - ${proxy_json_line}"
+            fi
+        fi
     done
     echo "-------------------------------------"
     

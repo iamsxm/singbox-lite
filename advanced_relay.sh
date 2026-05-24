@@ -667,30 +667,32 @@ _finalize_relay_setup() {
     fi
 
     _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
-    
+
     # --- 选择中转入口协议 ---
     echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"
     echo -e "    ${GREEN}[1]${NC} VLESS-Reality"
     echo -e "    ${GREEN}[2]${NC} Hysteria2"
     echo -e "    ${GREEN}[3]${NC} TUICv5"
     echo -e "    ${GREEN}[4]${NC} AnyTLS"
+    echo -e "    ${GREEN}[5]${NC} SOCKS5  ${YELLOW}(明文，无 TLS，仅适合内网中转或同机调试)${NC}"
     echo ""
-    read -p "  请输入选项 [1-4]: " relay_choice
-    
+    read -p "  请输入选项 [1-5]: " relay_choice
+
     local relay_type=""
     case "$relay_choice" in
         1) relay_type="vless-reality" ;;
         2) relay_type="hysteria2" ;;
         3) relay_type="tuic" ;;
         4) relay_type="anytls" ;;
+        5) relay_type="socks" ;;
         *) _error "无效选项"; return ;;
     esac
-    
+
     # --- 配置入口详细信息 ---
     while true; do
         read -p "  请输入本机监听端口 (回车随机): " listen_port
         [[ -z "$listen_port" ]] && listen_port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 40001 + 10000 ))
-        
+
         if _check_port_occupied "$listen_port"; then
             _error "端口 $listen_port 已被系统占用，请重新输入！"
         else
@@ -698,10 +700,14 @@ _finalize_relay_setup() {
             break
         fi
     done
-    
-    read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
-    [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
-    
+
+    # SOCKS5 入口不涉及 TLS，跳过 SNI 提问
+    local entrance_sni=""
+    if [ "$relay_type" != "socks" ]; then
+        read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
+        [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
+    fi
+
     local default_name="${dest_type}-Relay-${listen_port}"
     read -p "  请输入节点名称 (回车: ${default_name}): " node_name
     [[ -z "$node_name" ]] && node_name="$default_name"
@@ -806,8 +812,18 @@ _finalize_relay_setup() {
         local password=$($SINGBOX_BIN generate uuid)
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
-            
+
         link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#$(_url_encode "${node_name}")"
+
+    elif [ "$relay_type" == "socks" ]; then
+        # SOCKS5 中转入口：明文协议，无 TLS，使用随机用户名密码做基础认证
+        local socks_user=$($SINGBOX_BIN generate rand --hex 8)
+        local socks_pass=$($SINGBOX_BIN generate rand --hex 16)
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$socks_user" --arg pw "$socks_pass" \
+            '{"type":"socks","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"username":$u,"password":$pw}]}')
+
+        local socks_userinfo=$(echo -n "${socks_user}:${socks_pass}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+        link="socks://${socks_userinfo}@${link_ip}:${listen_port}#$(_url_encode "${node_name}")"
     fi
     
     # 2. 写入配置到主配置文件
@@ -878,6 +894,11 @@ _finalize_relay_setup() {
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
+    elif [ "$relay_type" == "socks" ]; then
+        local socks_user=$(echo "$inbound_json" | jq -r '.users[0].username')
+        local socks_pass=$(echo "$inbound_json" | jq -r '.users[0].password')
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg u "$socks_user" --arg pw "$socks_pass" \
+            '{name:$n,type:"socks5",server:$s,port:($p|tonumber),username:$u,password:$pw,udp:true}')
     fi
     [ -n "$proxy_json" ] && _add_node_to_relay_yaml "$proxy_json"
     
