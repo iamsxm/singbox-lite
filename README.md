@@ -50,7 +50,7 @@
 | TUICv5 | ✅ | ✅ | ✅ |
 | Shadowsocks | ✅ | ✅ | ✅ |
 | VLESS-TCP | ✅ | ❌ | ✅ |
-| SOCKS5 | ✅ | ❌ | ❌ |
+| SOCKS5 | ✅ | ✅ | ✅ |
 
 ### Xray 协议
 
@@ -86,7 +86,7 @@
 进入交互菜单手动配置节点：
 
 ```
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+(curl -LfsS https://raw.githubusercontent.com/iamsxm/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/iamsxm/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 **快捷命令：sb**
@@ -139,6 +139,7 @@
 - Hysteria2
 - TUICv5
 - Shadowsocks
+- SOCKS5
 ```
 
 ---
@@ -162,6 +163,7 @@
 - VLESS-TCP（第三方适配层）
 - Shadowsocks（第三方适配层）
 - 本地创建的节点
+- SOCKS5（适合接入已有的 SOCKS5 代理作为出口）
 
 > 第三方适配层的 Token 会自动使用 `127.0.0.1`
 
@@ -327,3 +329,7 @@
 ### 2026.05.04
 - **针对Docker/Podman优化**：优化了Podman容器的Alpine、Debian系统的安装流程，自动识别低内存压缩，保证安装顺利。
 - **singbox、Xray安装流程简化**：简化了安装流程，将时间同步拆分到主菜单独立选项[11] 同步系统时间，如果需要使用SS2022节点协议，如果发现搭建出来的节点不通，可以使用此功能进行时间同步。
+
+### 2026.05.24
+- **SOCKS5 协议完善**：主脚本搭建的 SOCKS5 节点现支持生成标准 `socks://Base64(user:pass)@host:port#name` 分享链接，兼容 v2rayN、Shadowrocket 等主流客户端；查看节点也会同步输出该链接。
+- **SOCKS5 中转支持**：进阶脚本中，SOCKS5 节点可作为落地节点直接生成中转 Token；中转机也支持导入 `socks://` / `socks5://` 第三方链接（明文 user:pass 或 Base64 编码均可识别），通过 sing-box 的 socks outbound 转发，适合对接已有 SOCKS5 代理出口。

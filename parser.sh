@@ -272,27 +272,56 @@ _parse_anytls() {
     fi
 }
 
-# 解析 SOCKS5 (支持有认证和无认证两种格式)
+# 解析 SOCKS5 (支持 socks5:// 和 socks:// 两种前缀，认证可以为 user:pass 明文或 Base64)
 _parse_socks() {
     local link="$1"
-    local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    # 有认证格式: socks5://user:pass@host:port#name
-    local regex_auth="socks5://([^:]+):([^@]+)@${host_regex}:([0-9]+)#?(.*)"
-    # 无认证格式: socks5://host:port#name
-    local regex_noauth="socks5://${host_regex}:([0-9]+)#?(.*)"
-    
-    if [[ $link =~ $regex_auth ]]; then
-        local user="${BASH_REMATCH[1]}"
-        local pass="${BASH_REMATCH[2]}"
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[3]}")
-        local port="${BASH_REMATCH[4]}"
-        
+    # 统一前缀: 把 socks5:// 改写为 socks:// 走同一套正则
+    local body="${link#socks5://}"
+    body="${body#socks://}"
+
+    # 剥离名称片段
+    local name=""
+    if [[ "$body" == *"#"* ]]; then
+        name=$(_decode "${body##*#}")
+        body="${body%%#*}"
+    fi
+    # 剥离 query 串 (SOCKS5 无 query 参数，保险起见)
+    body="${body%%\?*}"
+
+    local userinfo=""
+    local server_port="$body"
+    if [[ "$body" == *"@"* ]]; then
+        userinfo="${body%@*}"
+        server_port="${body##*@}"
+    fi
+
+    local split_result
+    split_result=$(_split_host_port "$server_port") || { echo '{"error": "服务器地址或端口格式错误"}'; return; }
+    local server port
+    IFS=$'\t' read -r server port <<< "$split_result"
+
+    local user="" pass=""
+    if [ -n "$userinfo" ]; then
+        local decoded_userinfo
+        if [[ "$userinfo" == *":"* ]]; then
+            # 明文 user:pass (可能URL编码过)
+            decoded_userinfo=$(_url_decode "$userinfo")
+        else
+            # 纯 Base64 (v2rayN 等客户端标准导出格式)
+            decoded_userinfo=$(_decode_base64_urlsafe "$userinfo")
+            # 解码失败时退回明文
+            [ -z "$decoded_userinfo" ] && decoded_userinfo=$(_url_decode "$userinfo")
+        fi
+        if [[ "$decoded_userinfo" == *":"* ]]; then
+            user="${decoded_userinfo%%:*}"
+            pass="${decoded_userinfo#*:}"
+        fi
+    fi
+
+    if [ -n "$user" ]; then
         jq -n --arg s "$server" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
-            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", users:[{username:$u, password:$pw}]}'
-    elif [[ $link =~ $regex_noauth ]]; then
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[1]}")
-        local port="${BASH_REMATCH[2]}"
-        
+            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", username:$u, password:$pw}'
+    else
         jq -n --arg s "$server" --argjson p "$port" \
             '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5"}'
     fi
@@ -306,6 +335,6 @@ case "$1" in
     hysteria2://*|hy2://*) _parse_hy2 "$1" ;;
     tuic://*) _parse_tuic "$1" ;;
     anytls://*) _parse_anytls "$1" ;;
-    socks5://*) _parse_socks "$1" ;;
+    socks://*|socks5://*) _parse_socks "$1" ;;
     *) echo "{\"error\": \"不支持的协议\"}"; exit 1 ;;
 esac

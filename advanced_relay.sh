@@ -193,8 +193,12 @@ _add_node_to_relay_yaml() {
     
     # 清理临时文件
     rm -f "$temp_json"
-    
+
     _info "已添加节点到 YAML 配置: ${proxy_name}"
+    # 打印 mihomo 单行配置 (函数由主脚本 export)
+    if command -v _show_mihomo_proxy_line >/dev/null 2>&1; then
+        _show_mihomo_proxy_line "$proxy_json"
+    fi
 }
 
 _remove_node_from_relay_yaml() {
@@ -294,7 +298,7 @@ _import_link_config() {
     echo '  ║   配置为 [中转机] (导入第三方链接)    ║'
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
-    echo "支持协议: VLESS-Reality, VLESS-WS， Hy2 (Hysteria2), TUICv5, Shadowsocks, Trojan-WS, AnyTLS"
+    echo "支持协议: VLESS-Reality, VLESS-WS， Hy2 (Hysteria2), TUICv5, Shadowsocks, Trojan-WS, AnyTLS, SOCKS5"
     echo ""
     read -p "  请输入节点分享链接: " share_link
     
@@ -593,7 +597,20 @@ _landing_config() {
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
                 '{"type":"anytls","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true}}')
             ;;
-            
+
+        "socks")
+            # SOCKS5 落地节点：sing-box outbound 需要直接的 username/password 字段（不是 users 数组）
+            local username=$(echo "$selected_node" | jq -r '.users[0].username // ""')
+            local password=$(echo "$selected_node" | jq -r '.users[0].password // ""')
+            if [ -n "$username" ] && [ -n "$password" ]; then
+                outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg u "$username" --arg pw "$password" \
+                    '{"type":"socks","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"version":"5","username":$u,"password":$pw}')
+            else
+                outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" \
+                    '{"type":"socks","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"version":"5"}')
+            fi
+            ;;
+
         *)
             _error "暂不支持对协议 [$type] 自动生成 Token。"
             return

@@ -259,6 +259,19 @@ _add_node_to_yaml() {
     _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies |= . + [${proxy_json}] | .proxies |= unique_by(.name)"
     export PROXY_NAME="$proxy_name"
     ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + [env(PROXY_NAME)] | .proxies |= unique)' -i "$CLASH_YAML_FILE"
+    _show_mihomo_proxy_line "$proxy_json"
+}
+# 打印 mihomo / Clash.Meta 单行节点配置 (YAML 兼容的 JSON flow style)
+# 可直接粘贴到 mihomo 配置的 proxies 列表下，或作为 proxy-providers 内容使用
+_show_mihomo_proxy_line() {
+    local proxy_json="$1"
+    [ -z "$proxy_json" ] && return
+    local compact=$(echo "$proxy_json" | jq -c .)
+    [ -z "$compact" ] && return
+    echo ""
+    echo -e "${YELLOW}═══════════════ mihomo / Clash.Meta 节点 ═══════════════${NC}"
+    echo -e "${CYAN}- ${compact}${NC}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════${NC}"
 }
 _remove_node_from_yaml() {
     local proxy_name="$1"
@@ -344,7 +357,7 @@ export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 _detect_init_system
 [ "$INIT_SYSTEM" == "openrc" ] && export SERVICE_FILE="/etc/init.d/sing-box" || export SERVICE_FILE="/etc/systemd/system/sing-box.service"
 
-export -f _info _success _warn _warning _error _url_encode _url_decode _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name
+export -f _info _success _warn _warning _error _url_encode _url_decode _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _show_mihomo_proxy_line
 
 server_ip=""
 BATCH_MODE=false
@@ -2102,9 +2115,15 @@ _show_node_link() {
         "socks")
             # 参数: username, password
             local username="$1" password="$2"
+            if [ -n "$username" ] && [ -n "$password" ]; then
+                # 标准 SOCKS5 分享链接 (v2rayN / Shadowrocket 通用): socks://Base64(user:pass)@host:port#name
+                local socks_userinfo=$(echo -n "${username}:${password}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+                url="socks://${socks_userinfo}@${link_ip}:${port}#$(_url_encode "$name")"
+            else
+                url="socks://${link_ip}:${port}#$(_url_encode "$name")"
+            fi
             echo ""
             _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 用户名: ${username}, 密码: ${password}"
-            return
             ;;
     esac
     
@@ -3438,6 +3457,12 @@ _view_nodes() {
                 local u p
                 IFS=$'\t' read -r u p <<< "$(echo "$node" | jq -r '[.users[0].username, .users[0].password] | @tsv')"
                 _info "  类型: SOCKS5, 地址: $display_server, 端口: $port, 用户: $u, 密码: $p"
+                if [ -n "$u" ] && [ -n "$p" ] && [ "$u" != "null" ] && [ "$p" != "null" ]; then
+                    local socks_userinfo=$(echo -n "${u}:${p}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+                    url="socks://${socks_userinfo}@${link_ip}:${port}#$(_url_encode "$display_name")"
+                else
+                    url="socks://${link_ip}:${port}#$(_url_encode "$display_name")"
+                fi
                 ;;
         esac
         fi
