@@ -83,18 +83,28 @@ _detect_init_system() {
 _check_port_occupied() {
     local port=$1
     local proto=${2:-tcp}
+    local hex_port
     if [[ "$proto" == "tcp" ]]; then
         if command -v ss &>/dev/null; then
             ss -lnpt | grep -q ":${port} " && return 0
-        else
+        elif command -v netstat &>/dev/null; then
             netstat -lnpt | grep -q ":${port} " && return 0
         fi
     else
         if command -v ss &>/dev/null; then
             ss -lnpu | grep -q ":${port} " && return 0
-        else
+        elif command -v netstat &>/dev/null; then
             netstat -lnpu | grep -q ":${port} " && return 0
         fi
+    fi
+
+    # 精简 Alpine/Podman 可能没有 ss/netstat，直接读取 /proc/net 保证端口检测仍可工作
+    hex_port=$(printf '%04X' "$port" 2>/dev/null)
+    [ -z "$hex_port" ] && return 1
+    if [[ "$proto" == "tcp" ]]; then
+        awk -v p="$hex_port" '$2 ~ ":" p "$" {found=1} END{exit !found}' /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0
+    else
+        awk -v p="$hex_port" '$2 ~ ":" p "$" {found=1} END{exit !found}' /proc/net/udp /proc/net/udp6 2>/dev/null && return 0
     fi
     return 1
 }
@@ -215,6 +225,7 @@ _atomic_modify_json() {
 _atomic_modify_yaml() {
     local file="$1" filter="$2"
     [ ! -f "$file" ] && return 1
+    _install_yq || return 1
     cp "$file" "${file}.tmp"
     if ${YQ_BINARY} eval "$filter" -i "$file"; then rm "${file}.tmp"
     else _error "修改YAML失败: $file"; mv "${file}.tmp" "$file"; return 1; fi
@@ -250,11 +261,13 @@ _sync_system_time() {
 # Clash YAML 节点管理
 _get_proxy_field() {
     local proxy_name="$1" field="$2"
+    _install_yq || return 1
     export PROXY_NAME="$proxy_name"
     ${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME)) | '"$field" "${CLASH_YAML_FILE}" 2>/dev/null | head -n 1
 }
 _add_node_to_yaml() {
     local proxy_json="$1"
+    _install_yq || return 1
     local proxy_name=$(echo "$proxy_json" | jq -r .name)
     _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies |= . + [${proxy_json}] | .proxies |= unique_by(.name)"
     export PROXY_NAME="$proxy_name"
@@ -275,23 +288,24 @@ _show_mihomo_proxy_line() {
 }
 _remove_node_from_yaml() {
     local proxy_name="$1"
+    _install_yq || return 1
     export PROXY_NAME="$proxy_name"
     ${YQ_BINARY} eval 'del(.proxies[] | select(.name == env(PROXY_NAME)))' -i "$CLASH_YAML_FILE"
     ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' -i "$CLASH_YAML_FILE"
 }
 _find_proxy_name() {
     local port="$1" type="$2" proxy_name=""
+    _install_yq || return 1
     local proxy_obj=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} 2>/dev/null | head -n 1)
     [ -n "$proxy_obj" ] && proxy_name=$(echo "$proxy_obj" | ${YQ_BINARY} eval '.name' -)
     [ -z "$proxy_name" ] && proxy_name=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} 2>/dev/null | grep -i "${type:-.}" | head -n 1)
     echo "$proxy_name"
 }
 
-# 内存限额计算
-_get_mem_limit() {
-    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+# 获取真实可用内存上限，优先读取 cgroup 限额以适配 Docker/Podman 低内存容器
+_get_total_mem_mb() {
+    local total_mem_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
     local cgroup_limit=""
-    local limit
 
     [ -z "$total_mem_mb" ] && total_mem_mb=128
 
@@ -307,8 +321,25 @@ _get_mem_limit() {
         fi
     fi
 
-    if [ "$total_mem_mb" -le 128 ]; then
-        limit=48
+    [ "$total_mem_mb" -lt 16 ] && total_mem_mb=16
+    echo "$total_mem_mb"
+}
+
+# 判断是否为低内存环境；64M Podman/Alpine 会走更保守的依赖和运行时策略
+_is_low_mem_env() {
+    local total_mem_mb=$(_get_total_mem_mb)
+    [ "$total_mem_mb" -le 96 ]
+}
+
+# 内存限额计算
+_get_mem_limit() {
+    local total_mem_mb=$(_get_total_mem_mb)
+    local limit
+
+    if [ "$total_mem_mb" -le 96 ]; then
+        limit=32
+    elif [ "$total_mem_mb" -le 128 ]; then
+        limit=40
     elif [ "$total_mem_mb" -le 256 ]; then
         limit=$((total_mem_mb * 50 / 100))
     elif [ "$total_mem_mb" -le 512 ]; then
@@ -319,6 +350,18 @@ _get_mem_limit() {
 
     [ "$limit" -lt 32 ] && limit=32
     echo "$limit"
+}
+
+# Go GC 策略随内存收紧；低内存容器用更积极 GC 换取不被 OOM kill
+_get_go_gc() {
+    local total_mem_mb=$(_get_total_mem_mb)
+    if [ "$total_mem_mb" -le 96 ]; then
+        echo 50
+    elif [ "$total_mem_mb" -le 128 ]; then
+        echo 75
+    else
+        echo 100
+    fi
 }
 
 # 安装阶段会产生较多文件缓存，低内存容器中尽力释放；失败不影响主流程
@@ -338,8 +381,14 @@ _install_yq() {
         _info "安装 yq..."
         local arch=$(uname -m)
         case $arch in x86_64|amd64) arch='amd64' ;; aarch64|arm64) arch='arm64' ;; *) arch='amd64' ;; esac
-        wget -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch"
-        chmod +x "$YQ_BINARY"
+        mkdir -p "$(dirname "$YQ_BINARY")" || return 1
+        if ! wget -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch"; then
+            rm -f "$YQ_BINARY"
+            _error "yq 下载失败。"
+            return 1
+        fi
+        chmod +x "$YQ_BINARY" || return 1
+        _release_install_cache
     fi
 }
 
@@ -357,17 +406,24 @@ export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 _detect_init_system
 [ "$INIT_SYSTEM" == "openrc" ] && export SERVICE_FILE="/etc/init.d/sing-box" || export SERVICE_FILE="/etc/systemd/system/sing-box.service"
 
-export -f _info _success _warn _warning _error _url_encode _url_decode _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _show_mihomo_proxy_line
+export -f _info _success _warn _warning _error _url_encode _url_decode _get_public_ip _detect_init_system _sync_system_time _release_install_cache _install_yq _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_total_mem_mb _is_low_mem_env _get_mem_limit _get_go_gc _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _show_mihomo_proxy_line
 
 server_ip=""
 BATCH_MODE=false
 trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
 # 依赖安装
 _install_dependencies() {
-    # 核心依赖：脚本运行的绝对前提，必须全部装上
-    local core_pkgs="curl jq openssl wget tar"
-    # 可选依赖：部分功能需要，即使装失败也不致命
+    # 核心依赖按缺失项安装，避免每次打开菜单都触发包管理器造成低内存抖动
+    local core_pkgs=""
     local optional_pkgs="procps iptables socat iproute2 cron lsof"
+    local cmd
+
+    for cmd in curl jq openssl wget tar; do
+        command -v "$cmd" &>/dev/null || core_pkgs="${core_pkgs} ${cmd}"
+    done
+    if command -v apk &>/dev/null && [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+        core_pkgs="${core_pkgs} ca-certificates"
+    fi
     
     # 针对不同发行版的 cron 包名适配
     if command -v apk &>/dev/null; then
@@ -376,22 +432,29 @@ _install_dependencies() {
         optional_pkgs="${optional_pkgs/cron/cronie}"
     fi
 
-    _info "正在安装核心依赖..."
-    _pkg_install $core_pkgs
+    if [ -n "$core_pkgs" ]; then
+        _info "正在安装缺失的核心依赖:${core_pkgs}"
+        _pkg_install $core_pkgs
+        _release_install_cache
+    fi
     
-    _info "正在安装可选依赖..."
-    _pkg_install $optional_pkgs 2>/dev/null || {
-        # 可选依赖批量安装失败时（如 iptables 冲突），逐个尝试
-        _warn "部分可选依赖批量安装遇到冲突，正在逐个重试..."
-        for pkg in $optional_pkgs; do
-            _pkg_install "$pkg" 2>/dev/null || true
-        done
-    }
-    
-    _install_yq
+    if _is_low_mem_env; then
+        # 64M Podman/Alpine 下可选包会显著拉高安装峰值，改为功能触发时再按需安装
+        _warn "检测到低内存环境 ($(_get_total_mem_mb)MiB)，跳过可选依赖预安装。"
+    else
+        _info "正在安装可选依赖..."
+        _pkg_install $optional_pkgs 2>/dev/null || {
+            # 可选依赖批量安装失败时（如 iptables 冲突），逐个尝试
+            _warn "部分可选依赖批量安装遇到冲突，正在逐个重试..."
+            for pkg in $optional_pkgs; do
+                _pkg_install "$pkg" 2>/dev/null || true
+            done
+        }
+        _release_install_cache
+    fi
 
     # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
-    if command -v apk &>/dev/null; then
+    if ! _is_low_mem_env && command -v apk &>/dev/null; then
         if command -v crond &>/dev/null; then
             rc-service dcron start 2>/dev/null
             rc-update add dcron default 2>/dev/null
@@ -449,6 +512,7 @@ _install_sing_box() {
     local temp_dir=""
     local archive_path=""
     local extracted_bin=""
+    local archive_member=""
     case $arch in
         x86_64|amd64) arch_tag='amd64' ;;
         aarch64|arm64) arch_tag='arm64' ;;
@@ -465,8 +529,7 @@ _install_sing_box() {
     
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local release_info=$(curl -s "$api_url")
-    local download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
+    local download_url=$(curl -fsSL "$api_url" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
 
     if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; return 1; fi
 
@@ -480,17 +543,20 @@ _install_sing_box() {
         return 1
     fi
 
-    _info "正在解压 sing-box 安装包..."
-    if ! tar -xzf "$archive_path" -C "$temp_dir"; then
-        _error "解压 sing-box 安装包失败，临时目录保留: $temp_dir"
+    _info "正在定位 sing-box 二进制文件..."
+    archive_member=$(tar -tzf "$archive_path" 2>/dev/null | awk '/(^|\/)sing-box$/ {print; exit}')
+    if [ -z "$archive_member" ]; then
+        _error "安装包内未找到 sing-box 二进制文件，临时目录保留: $temp_dir"
         return 1
     fi
 
-    extracted_bin=$(find "$temp_dir" -name sing-box -type f 2>/dev/null | head -n 1)
-    if [ -z "$extracted_bin" ]; then
-        _error "解压后未找到 sing-box 二进制文件，临时目录保留: $temp_dir"
+    _info "正在解压 sing-box 二进制文件..."
+    # 低内存安装只提取二进制文件，避免完整展开 release 包造成页缓存和磁盘峰值上涨
+    if ! tar -xzf "$archive_path" -C "$temp_dir" "$archive_member"; then
+        _error "解压 sing-box 二进制文件失败，临时目录保留: $temp_dir"
         return 1
     fi
+    extracted_bin="${temp_dir}/${archive_member}"
 
     rm -f "$archive_path"
 
@@ -703,6 +769,13 @@ _add_argo_node() {
     esac
 
     _info "--- 创建 ${protocol_label} + Argo 隧道节点 ---"
+
+    if _is_low_mem_env; then
+        # cloudflared 与 sing-box 同时常驻会明显超过 64M 容器余量，直接阻止以避免 OOM kill
+        _error "检测到低内存环境 ($(_get_total_mem_mb)MiB)，不建议运行 Argo/cloudflared。"
+        _error "请提高容器内存到至少 128M，或仅运行 sing-box 节点。"
+        return 1
+    fi
 
     # 安装 cloudflared
     _install_cloudflared || return 1
@@ -1516,6 +1589,7 @@ _argo_menu() {
 
 _create_systemd_service() {
     local mem_limit_mb=$(_get_mem_limit)
+    local go_gc=$(_get_go_gc)
     
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -1525,6 +1599,7 @@ After=network.target nss-lookup.target
 
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
+Environment="GOGC=${go_gc}"
 Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
 Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
 Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
@@ -1542,6 +1617,7 @@ _create_openrc_service() {
     # 确保日志文件存在
     touch "${LOG_FILE}"
     local mem_limit_mb=$(_get_mem_limit)
+    local go_gc=$(_get_go_gc)
     
     cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
@@ -1551,7 +1627,7 @@ command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${go_gc} --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 respawn_delay=3
 respawn_max=0
 
@@ -5027,6 +5103,10 @@ main() {
             fi
             if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "supervisor=" "$SERVICE_FILE"; then
                 _warn "检测到旧版 OpenRC 服务配置，正在修复以兼容 Alpine..."
+                need_update=true
+            fi
+            if ! grep -q "GOGC=" "$SERVICE_FILE"; then
+                _warn "检测到服务缺少低内存 GC 参数，正在修复..."
                 need_update=true
             fi
             if [ "$need_update" = true ]; then
