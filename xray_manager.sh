@@ -188,6 +188,203 @@ if ! declare -f _get_public_ip >/dev/null 2>&1; then
     }
 fi
 
+# ---------------- 入站来源 IP 白名单 ----------------
+_validate_xray_ipv6_part() {
+    local part="$1"
+    [ -z "$part" ] && return 0
+    [[ "$part" != :* && "$part" != *: ]] || return 1
+    local hextets=()
+    IFS=':' read -r -a hextets <<< "$part"
+    [ "${#hextets[@]}" -gt 0 ] || return 1
+    local hextet
+    for hextet in "${hextets[@]}"; do
+        [[ "$hextet" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+}
+
+_normalize_xray_inbound_ip() {
+    local value="$1" address="" prefix=""
+    value="${value#[}"
+    value="${value%]}"
+    if [[ "$value" == */* ]]; then
+        address="${value%%/*}"
+        prefix="${value#*/}"
+        [[ "$prefix" != */* ]] || return 1
+    else
+        address="$value"
+    fi
+
+    if [[ "$address" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+        local octets=()
+        IFS='.' read -r -a octets <<< "$address"
+        [ "${#octets[@]}" -eq 4 ] || return 1
+        local octet
+        for octet in "${octets[@]}"; do
+            [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+            [ "$((10#$octet))" -le 255 ] || return 1
+        done
+        [ -z "$prefix" ] && prefix=32
+        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+        [ "$((10#$prefix))" -le 32 ] || return 1
+        printf '%d.%d.%d.%d/%d' "$((10#${octets[0]}))" "$((10#${octets[1]}))" "$((10#${octets[2]}))" "$((10#${octets[3]}))" "$((10#$prefix))"
+        return 0
+    fi
+
+    [[ "$address" == *:* ]] || return 1
+    [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [ -z "$prefix" ] && prefix=128
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    [ "$((10#$prefix))" -le 128 ] || return 1
+
+    local left="" right="" left_count=0 right_count=0 total=0
+    if [[ "$address" == *::* ]]; then
+        [[ "${address#*::}" != *::* ]] || return 1
+        left="${address%%::*}"
+        right="${address#*::}"
+        _validate_xray_ipv6_part "$left" || return 1
+        _validate_xray_ipv6_part "$right" || return 1
+        [ -n "$left" ] && left_count=$(awk -F: '{print NF}' <<< "$left")
+        [ -n "$right" ] && right_count=$(awk -F: '{print NF}' <<< "$right")
+        total=$((left_count + right_count))
+        [ "$total" -le 7 ] || return 1
+    else
+        _validate_xray_ipv6_part "$address" || return 1
+        total=$(awk -F: '{print NF}' <<< "$address")
+        [ "$total" -eq 8 ] || return 1
+    fi
+    printf '%s/%d' "$address" "$((10#$prefix))"
+}
+
+_normalize_xray_inbound_ip_list() {
+    local raw="${1//,/ }" compact="${1//,/ }"
+    compact="${compact//[[:space:]]/}"
+    [ -n "$compact" ] || return 0
+    local values=()
+    read -r -a values <<< "$raw"
+    [ "${#values[@]}" -gt 0 ] || return 1
+    local value normalized result=()
+    for value in "${values[@]}"; do
+        normalized=$(_normalize_xray_inbound_ip "$value") || return 1
+        result+=("$normalized")
+    done
+    local IFS=' '
+    printf '%s' "${result[*]}"
+}
+
+_prompt_xray_allowed_inbound_ips() {
+    XRAY_ALLOWED_INBOUND_IPS=""
+    local raw="" normalized=""
+    while true; do
+        read -p "允许的入站来源 IP/CIDR（多个用逗号或空格分隔，留空不限）: " raw
+        normalized=$(_normalize_xray_inbound_ip_list "$raw")
+        if [ $? -eq 0 ]; then
+            XRAY_ALLOWED_INBOUND_IPS="$normalized"
+            [ -n "$normalized" ] && _info "已启用入站来源 IP 白名单: ${normalized// /, }"
+            return 0
+        fi
+        _error "IP/CIDR 格式无效，请重新输入。例如: 203.0.113.10, 2001:db8::/32"
+    done
+}
+
+_apply_xray_inbound_ip_policy() {
+    local tag="$1" ips="$2"
+    [ -n "$tag" ] && [ -f "$XRAY_CONFIG" ] || return 1
+    local tmp="${XRAY_CONFIG}.tmp.$$"
+    if [ -n "$ips" ]; then
+        jq --arg tag "$tag" --arg ips "$ips" '
+            def has_tag:
+                (.inboundTag? == $tag) or
+                ((.inboundTag? | type) == "array" and ((.inboundTag | index($tag)) != null));
+            .routing = (.routing // {}) |
+            .outbounds = (.outbounds // []) |
+            if any(.outbounds[]?; .tag == "block") then .
+            else .outbounds += [{"protocol":"blackhole","tag":"block"}] end |
+            .routing.rules = [
+                {"type":"field","inboundTag":[$tag],"source":($ips | split(" ")),"outboundTag":"direct"},
+                {"type":"field","inboundTag":[$tag],"outboundTag":"block"}
+            ] + ((.routing.rules // []) | map(select(
+                (has_tag and ((.source? != null) or (.outboundTag? == "block"))) | not
+            )))
+        ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null || {
+            rm -f "$tmp"
+            _error "写入 Xray 入站 IP 白名单失败。"
+            return 1
+        }
+        mv "$tmp" "$XRAY_CONFIG"
+        if [ -f "$XRAY_METADATA" ]; then
+            jq --arg tag "$tag" --arg ips "$ips" \
+                '.[$tag] = ((.[$tag] // {}) + {allowedInboundIPs: ($ips | split(" "))})' \
+                "$XRAY_METADATA" > "$tmp" 2>/dev/null && mv "$tmp" "$XRAY_METADATA" || rm -f "$tmp"
+        fi
+    else
+        jq --arg tag "$tag" '
+            def has_tag:
+                (.inboundTag? == $tag) or
+                ((.inboundTag? | type) == "array" and ((.inboundTag | index($tag)) != null));
+            if (.routing? | type) == "object" and ((.routing.rules? | type) == "array") then
+                .routing.rules |= map(select(
+                    (has_tag and ((.source? != null) or (.outboundTag? == "block"))) | not
+                ))
+            else . end
+        ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+        mv "$tmp" "$XRAY_CONFIG"
+        if [ -f "$XRAY_METADATA" ]; then
+            jq --arg tag "$tag" 'del(.[$tag].allowedInboundIPs)' "$XRAY_METADATA" > "$tmp" 2>/dev/null && mv "$tmp" "$XRAY_METADATA" || rm -f "$tmp"
+        fi
+    fi
+}
+
+_remove_xray_inbound_ip_policy() {
+    _apply_xray_inbound_ip_policy "$1" ""
+}
+
+_rename_xray_inbound_ip_policy() {
+    local old_tag="$1" new_tag="$2"
+    [ -f "$XRAY_CONFIG" ] || return 0
+    local tmp="${XRAY_CONFIG}.tmp.$$"
+    jq --arg old "$old_tag" --arg new "$new_tag" '
+        if (.routing? | type) == "object" and ((.routing.rules? | type) == "array") then
+            .routing.rules |= map(
+                if .inboundTag? == $old then .inboundTag = [$new]
+                elif (.inboundTag? | type) == "array" then .inboundTag |= map(if . == $old then $new else . end)
+                else . end
+            )
+        else . end
+    ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null && mv "$tmp" "$XRAY_CONFIG" || { rm -f "$tmp"; return 1; }
+}
+
+_apply_xray_policy_to_new_nodes() {
+    local before_tags="$1" ips="$2"
+    [ -n "$ips" ] || return 0
+    local new_tags
+    new_tags=$(jq -r --arg before "$before_tags" \
+        '.inbounds[]?.tag as $tag | select($tag != null and (($before | split(" ") | index($tag)) == null)) | $tag' \
+        "$XRAY_CONFIG" 2>/dev/null | tr '\n' ' ')
+    [ -n "${new_tags// /}" ] || return 0
+
+    local tmp="${XRAY_CONFIG}.tmp.$$"
+    jq --arg tags "$new_tags" --arg ips "$ips" '
+        ($tags | split(" ") | map(select(length > 0))) as $new_tags |
+        .routing = (.routing // {}) |
+        .outbounds = (.outbounds // []) |
+        if any(.outbounds[]?; .tag == "block") then .
+        else .outbounds += [{"protocol":"blackhole","tag":"block"}] end |
+        .routing.rules =
+            ([$new_tags[] | {"type":"field","inboundTag":[.],"source":($ips | split(" ")),"outboundTag":"direct"}] +
+            [$new_tags[] | {"type":"field","inboundTag":[.],"outboundTag":"block"}] +
+            (.routing.rules // []))
+    ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$XRAY_CONFIG"
+
+    if [ -f "$XRAY_METADATA" ]; then
+        jq --arg tags "$new_tags" --arg ips "$ips" '
+            reduce (($tags | split(" "))[] | select(length > 0)) as $tag (.;
+                .[$tag] = ((.[$tag] // {}) + {allowedInboundIPs: ($ips | split(" "))})
+            )
+        ' "$XRAY_METADATA" > "$tmp" 2>/dev/null && mv "$tmp" "$XRAY_METADATA" || { rm -f "$tmp"; return 1; }
+    fi
+}
+
 # --- 自签证书生成 (Hysteria2 专用) ---
 _generate_xray_cert() {
     local domain="$1" cert_path="$2" key_path="$3"
@@ -1048,12 +1245,14 @@ _view_xray_nodes() {
         local security=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .streamSettings.security // \"none\"" "$XRAY_CONFIG")
         local name=$(jq -r ".\"$tag\".name // \"$tag\"" "$XRAY_METADATA" 2>/dev/null)
         local link=$(jq -r ".\"$tag\".share_link // empty" "$XRAY_METADATA" 2>/dev/null)
+        local allowed_inbound_ips=$(jq -r --arg t "$tag" '.[$t].allowedInboundIPs // [] | join(", ")' "$XRAY_METADATA" 2>/dev/null)
         local desc="${protocol}"
         [ "$network" != "null" ] && [ "$network" != "tcp" ] && desc="${desc}+${network}"
         [ "$security" != "null" ] && [ "$security" != "none" ] && desc="${desc}+${security}"
         echo ""
         echo -e "  ${GREEN}[${count}]${NC} ${CYAN}${name}${NC}"
         echo -e "      协议: ${YELLOW}${desc}${NC}  |  端口: ${GREEN}${port}${NC}  |  标签: ${CYAN}${tag}${NC}"
+        [ -n "$allowed_inbound_ips" ] && echo -e "      入站来源白名单: ${YELLOW}${allowed_inbound_ips}${NC}"
         [ -n "$link" ] && echo -e "      ${YELLOW}分享链接:${NC} ${link}"
     done
     echo ""
@@ -1088,6 +1287,7 @@ _delete_xray_node() {
     read -p "$(echo -e ${RED}"确定删除 [$target_name]? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
     [ -n "$target_name" ] && [ "$target_name" != "null" ] && _remove_node_from_yaml "$target_name"
+    _remove_xray_inbound_ip_policy "$target_tag" 2>/dev/null || true
     rm -f "${XRAY_DIR}/${target_tag}.pem" "${XRAY_DIR}/${target_tag}.key" 2>/dev/null
     _atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$target_tag\"))"
     _atomic_modify_json "$XRAY_METADATA" "del(.\"$target_tag\")" 2>/dev/null
@@ -1107,6 +1307,7 @@ _delete_all_xray_nodes() {
     for tag in $tags; do
         local name=$(jq -r ".\"$tag\".name // empty" "$XRAY_METADATA" 2>/dev/null)
         [ -n "$name" ] && _remove_node_from_yaml "$name"
+        _remove_xray_inbound_ip_policy "$tag" 2>/dev/null || true
         rm -f "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key" 2>/dev/null
     done
     _atomic_modify_json "$XRAY_CONFIG" '.inbounds = []'
@@ -1148,6 +1349,7 @@ _modify_xray_port() {
     # 1. 更新 config.json: 端口 + tag
     _atomic_modify_json "$XRAY_CONFIG" "(.inbounds[] | select(.tag == \"$target_tag\") | .port) = $new_port"
     _atomic_modify_json "$XRAY_CONFIG" "(.inbounds[] | select(.tag == \"$target_tag\") | .tag) = \"$new_tag\""
+    _rename_xray_inbound_ip_policy "$target_tag" "$new_tag" || return
     
     # 2. 更新 clash.yaml: 端口 + 名称
     if [ -n "$target_name" ] && [ "$target_name" != "null" ]; then
@@ -1209,18 +1411,33 @@ _xray_add_node_menu() {
             _error "Xray 尚未安装！请先安装 Xray 核心。"
             read -p "按回车键返回..."; continue
         fi
+        local before_policy_tags=""
+        XRAY_ALLOWED_INBOUND_IPS=""
+        if [[ "$choice" =~ ^[1-8]$ ]]; then
+            _prompt_xray_allowed_inbound_ips || continue
+            before_policy_tags=$(jq -r '.inbounds[]?.tag // empty' "$XRAY_CONFIG" 2>/dev/null | tr '\n' ' ')
+        fi
+        local action_result=1
         case $choice in
-            1) _add_vless_reality_vision && _manage_xray_service "restart" ;;
-            2) _add_vless_grpc_reality && _manage_xray_service "restart" ;;
-            3) _add_trojan_xhttp_reality && _manage_xray_service "restart" ;;
-            4) _add_trojan_grpc_reality && _manage_xray_service "restart" ;;
-            5) _add_vless_h2_tls && _manage_xray_service "restart" ;;
-            6) _add_vless_grpc_tls && _manage_xray_service "restart" ;;
-            7) _add_trojan_grpc_tls && _manage_xray_service "restart" ;;
-            8) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
+            1) _add_vless_reality_vision; action_result=$? ;;
+            2) _add_vless_grpc_reality; action_result=$? ;;
+            3) _add_trojan_xhttp_reality; action_result=$? ;;
+            4) _add_trojan_grpc_reality; action_result=$? ;;
+            5) _add_vless_h2_tls; action_result=$? ;;
+            6) _add_vless_grpc_tls; action_result=$? ;;
+            7) _add_trojan_grpc_tls; action_result=$? ;;
+            8) _add_shadowsocks_xray; action_result=$? ;;
             0) return ;;
             *) _error "无效输入" ;;
         esac
+        if [ "$action_result" -eq 0 ] 2>/dev/null; then
+            if [ -n "$XRAY_ALLOWED_INBOUND_IPS" ]; then
+                _apply_xray_policy_to_new_nodes "$before_policy_tags" "$XRAY_ALLOWED_INBOUND_IPS" || \
+                    _warn "节点已创建，但入站 IP 白名单写入失败，请检查 Xray 配置文件。"
+            fi
+            _manage_xray_service "restart"
+        fi
+        unset XRAY_ALLOWED_INBOUND_IPS
         echo ""; read -p "按回车键继续..."
     done
 }

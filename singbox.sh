@@ -65,6 +65,263 @@ _get_public_ip() {
 }
 _get_ip() { _get_public_ip; } # 别名兼容
 
+# ---------------- 入站来源 IP 白名单 ----------------
+# 将单个 IP 统一转换为 CIDR，便于 sing-box/Xray 使用同一套输入格式。
+_validate_inbound_ipv6_part() {
+    local part="$1"
+    [ -z "$part" ] && return 0
+    [[ "$part" != :* && "$part" != *: ]] || return 1
+
+    local hextets=()
+    IFS=':' read -r -a hextets <<< "$part"
+    [ "${#hextets[@]}" -gt 0 ] || return 1
+    local hextet
+    for hextet in "${hextets[@]}"; do
+        [[ "$hextet" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    return 0
+}
+
+_normalize_inbound_ip() {
+    local value="$1"
+    local address="" prefix=""
+    value="${value#[}"
+    value="${value%]}"
+
+    if [[ "$value" == */* ]]; then
+        address="${value%%/*}"
+        prefix="${value#*/}"
+        [[ "$prefix" != */* ]] || return 1
+    else
+        address="$value"
+    fi
+
+    if [[ "$address" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+        local octets=()
+        IFS='.' read -r -a octets <<< "$address"
+        [ "${#octets[@]}" -eq 4 ] || return 1
+        local octet
+        for octet in "${octets[@]}"; do
+            [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+            [ "$((10#$octet))" -le 255 ] || return 1
+        done
+        [ -z "$prefix" ] && prefix=32
+        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+        [ "$((10#$prefix))" -le 32 ] || return 1
+        printf '%d.%d.%d.%d/%d' "$((10#${octets[0]}))" "$((10#${octets[1]}))" "$((10#${octets[2]}))" "$((10#${octets[3]}))" "$((10#$prefix))"
+        return 0
+    fi
+
+    [[ "$address" == *:* ]] || return 1
+    [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [ -z "$prefix" ] && prefix=128
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    [ "$((10#$prefix))" -le 128 ] || return 1
+
+    local left="" right="" left_count=0 right_count=0 total=0
+    if [[ "$address" == *::* ]]; then
+        # IPv6 只能有一个压缩段，且压缩段至少代表一个 hextet。
+        [[ "${address#*::}" != *::* ]] || return 1
+        left="${address%%::*}"
+        right="${address#*::}"
+        _validate_inbound_ipv6_part "$left" || return 1
+        _validate_inbound_ipv6_part "$right" || return 1
+        [ -n "$left" ] && left_count=$(awk -F: '{print NF}' <<< "$left")
+        [ -n "$right" ] && right_count=$(awk -F: '{print NF}' <<< "$right")
+        total=$((left_count + right_count))
+        [ "$total" -le 7 ] || return 1
+    else
+        _validate_inbound_ipv6_part "$address" || return 1
+        total=$(awk -F: '{print NF}' <<< "$address")
+        [ "$total" -eq 8 ] || return 1
+    fi
+    printf '%s/%d' "$address" "$((10#$prefix))"
+}
+
+_normalize_inbound_ip_list() {
+    local raw="${1//,/ }"
+    local compact="${raw//[[:space:]]/}"
+    [ -n "$compact" ] || return 0
+
+    local values=()
+    read -r -a values <<< "$raw"
+    [ "${#values[@]}" -gt 0 ] || return 1
+
+    local value normalized result=()
+    for value in "${values[@]}"; do
+        normalized=$(_normalize_inbound_ip "$value") || return 1
+        result+=("$normalized")
+    done
+    local IFS=' '
+    printf '%s' "${result[*]}"
+}
+
+_prompt_allowed_inbound_ips() {
+    ALLOWED_INBOUND_IPS=""
+    local raw="" normalized=""
+    while true; do
+        read -p "允许的入站来源 IP/CIDR（多个用逗号或空格分隔，留空不限）: " raw
+        normalized=$(_normalize_inbound_ip_list "$raw")
+        if [ $? -eq 0 ]; then
+            ALLOWED_INBOUND_IPS="$normalized"
+            [ -n "$normalized" ] && _info "已启用入站来源 IP 白名单: ${normalized// /, }"
+            return 0
+        fi
+        _error "IP/CIDR 格式无效，请重新输入。例如: 203.0.113.10, 2001:db8::/32"
+    done
+}
+
+_apply_singbox_inbound_ip_policy() {
+    local tag="$1" ips="$2"
+    [ -n "$tag" ] || return 1
+    [ -f "$CONFIG_FILE" ] || return 1
+
+    local tmp="${CONFIG_FILE}.tmp.$$"
+    if [ -n "$ips" ]; then
+        jq --arg tag "$tag" --arg ips "$ips" '
+            def has_tag:
+                (.inbound? == $tag) or
+                ((.inbound? | type) == "array" and ((.inbound | index($tag)) != null));
+            .route = (.route // {}) |
+            .route.rules = [
+                {
+                    "action": "route",
+                    "inbound": [$tag],
+                    "source_ip_cidr": ($ips | split(" ")),
+                    "outbound": "direct"
+                },
+                {"action": "reject", "inbound": [$tag]}
+            ] + ((.route.rules // []) | map(select(
+                (has_tag and ((.source_ip_cidr? != null) or (.action? == "reject"))) | not
+            )))
+        ' "$CONFIG_FILE" > "$tmp" 2>/dev/null || {
+            rm -f "$tmp"
+            _error "写入 sing-box 入站 IP 白名单失败。"
+            return 1
+        }
+        mv "$tmp" "$CONFIG_FILE"
+        if [ -f "$METADATA_FILE" ]; then
+            jq --arg tag "$tag" --arg ips "$ips" \
+                '.[$tag] = ((.[$tag] // {}) + {allowedInboundIPs: ($ips | split(" "))})' \
+                "$METADATA_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$METADATA_FILE" || rm -f "$tmp"
+        fi
+    else
+        jq --arg tag "$tag" '
+            def has_tag:
+                (.inbound? == $tag) or
+                ((.inbound? | type) == "array" and ((.inbound | index($tag)) != null));
+            if (.route? | type) == "object" and ((.route.rules? | type) == "array") then
+                .route.rules |= map(select(
+                    (has_tag and ((.source_ip_cidr? != null) or (.action? == "reject"))) | not
+                ))
+            else . end
+        ' "$CONFIG_FILE" > "$tmp" 2>/dev/null || {
+            rm -f "$tmp"
+            return 1
+        }
+        mv "$tmp" "$CONFIG_FILE"
+        if [ -f "$METADATA_FILE" ]; then
+            jq --arg tag "$tag" 'del(.[$tag].allowedInboundIPs)' "$METADATA_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$METADATA_FILE" || rm -f "$tmp"
+        fi
+    fi
+}
+
+_remove_singbox_inbound_ip_policy() {
+    _apply_singbox_inbound_ip_policy "$1" ""
+}
+
+_remove_singbox_inbound_ip_policy_prefix() {
+    local prefix="$1"
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp="${CONFIG_FILE}.tmp.$$"
+    jq --arg prefix "$prefix" '
+        def has_prefix:
+            if (.inbound? | type) == "string" then
+                (.inbound | startswith($prefix))
+            elif (.inbound? | type) == "array" then
+                any(.inbound[]; startswith($prefix))
+            else false end;
+        if (.route? | type) == "object" and ((.route.rules? | type) == "array") then
+            .route.rules |= map(select(
+                (has_prefix and ((.source_ip_cidr? != null) or (.action? == "reject"))) | not
+            ))
+        else . end
+    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
+    if [ -f "$METADATA_FILE" ]; then
+        jq --arg prefix "$prefix" 'with_entries(select(.key | startswith($prefix) | not))' "$METADATA_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$METADATA_FILE" || rm -f "$tmp"
+    fi
+}
+
+_remove_singbox_inbound_ip_policies_for_tags() {
+    local tags="$1"
+    [ -n "${tags// /}" ] || return 0
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp="${CONFIG_FILE}.tmp.$$"
+    jq --arg tags "$tags" '
+        ($tags | split(" ") | map(select(length > 0))) as $policy_tags |
+        def has_policy_tag:
+            if (.inbound? | type) == "string" then
+                (.inbound as $tag | ($policy_tags | index($tag)) != null)
+            elif (.inbound? | type) == "array" then
+                any(.inbound[]; . as $tag | (($policy_tags | index($tag)) != null))
+            else false end;
+        if (.route? | type) == "object" and ((.route.rules? | type) == "array") then
+            .route.rules |= map(select(
+                (has_policy_tag and ((.source_ip_cidr? != null) or (.action? == "reject"))) | not
+            ))
+        else . end
+    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+_rename_singbox_inbound_ip_policy() {
+    local old_tag="$1" new_tag="$2"
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp="${CONFIG_FILE}.tmp.$$"
+    jq --arg old "$old_tag" --arg new "$new_tag" '
+        if (.route? | type) == "object" and ((.route.rules? | type) == "array") then
+            .route.rules |= map(
+                if .inbound? == $old then .inbound = [$new]
+                elif (.inbound? | type) == "array" then .inbound |= map(if . == $old then $new else . end)
+                else . end
+            )
+        else . end
+    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+_apply_singbox_policy_to_new_nodes() {
+    local before_tags="$1" ips="$2"
+    [ -n "$ips" ] || return 0
+    local new_tags
+    new_tags=$(jq -r --arg before "$before_tags" \
+        '.inbounds[]?.tag as $tag | select($tag != null and (($before | split(" ") | index($tag)) == null)) | $tag' \
+        "$CONFIG_FILE" 2>/dev/null | tr '\n' ' ')
+    [ -n "${new_tags// /}" ] || return 0
+
+    local tmp="${CONFIG_FILE}.tmp.$$"
+    jq --arg tags "$new_tags" --arg ips "$ips" '
+        ($tags | split(" ") | map(select(length > 0))) as $new_tags |
+        .route = (.route // {}) |
+        .route.rules =
+            ([$new_tags[] | {
+                "action": "route",
+                "inbound": [.],
+                "source_ip_cidr": ($ips | split(" ")),
+                "outbound": "direct"
+            }] +
+            [$new_tags[] | {"action": "reject", "inbound": [.]}] +
+            (.route.rules // []))
+    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$CONFIG_FILE"
+
+    if [ -f "$METADATA_FILE" ]; then
+        jq --arg tags "$new_tags" --arg ips "$ips" '
+            reduce (($tags | split(" "))[] | select(length > 0)) as $tag (.;
+                .[$tag] = ((.[$tag] // {}) + {allowedInboundIPs: ($ips | split(" "))})
+            )
+        ' "$METADATA_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$METADATA_FILE" || { rm -f "$tmp"; return 1; }
+    fi
+}
+
 # 系统环境检测
 _detect_init_system() {
     if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then
@@ -3417,6 +3674,9 @@ _view_nodes() {
         echo "-------------------------------------"
         # [!] 已修改：使用 display_name
         _info " 节点: ${display_name}"
+        local allowed_inbound_ips
+        allowed_inbound_ips=$(jq -r --arg t "$tag" '.[$t].allowedInboundIPs // [] | join(", ")' "$METADATA_FILE" 2>/dev/null)
+        [ -n "$allowed_inbound_ips" ] && _info " 入站来源白名单: ${allowed_inbound_ips}"
         local url=""
         
         # [新架构] 优先使用持久化生成的链接（从极源解决动态提取可能存在的 SNI 丢失死角）
@@ -3648,6 +3908,8 @@ _delete_node() {
         fi
         
         # 清空配置
+        local existing_policy_tags=$(jq -r '.inbounds[]?.tag // empty' "$CONFIG_FILE" 2>/dev/null | tr '\n' ' ')
+        _remove_singbox_inbound_ip_policies_for_tags "$existing_policy_tags" 2>/dev/null || true
         _atomic_modify_json "$CONFIG_FILE" '.inbounds = []'
         _atomic_modify_json "$METADATA_FILE" '{}'
         
@@ -3690,8 +3952,10 @@ _delete_node() {
     if [ -n "$node_metadata" ]; then
         node_type=$(echo "$node_metadata" | jq -r '.type // empty')
     fi
-    
+
     # [!] 重要修正：不使用索引删除（因为列表已过滤），改为使用 Tag 精确匹配删除
+    _remove_singbox_inbound_ip_policy "$tag_to_del" 2>/dev/null || true
+    _remove_singbox_inbound_ip_policy_prefix "${tag_to_del}-hop-" 2>/dev/null || true
     _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag_to_del\"))" || return
     
     # [!] 新增：精准剥离该节点绑定的系统级防火墙端口跳跃策略
@@ -3843,6 +4107,10 @@ _modify_port() {
     local final_hop_info=""
     local final_hop_start=""
     local final_hop_end=""
+    local allowed_inbound_ips=""
+    if [ -f "$METADATA_FILE" ]; then
+        allowed_inbound_ips=$(jq -r --arg t "$tag_to_modify" '.[$t].allowedInboundIPs // [] | join(" ")' "$METADATA_FILE" 2>/dev/null)
+    fi
     
     _info "当前节点: ${display_name_to_modify} (${type_to_modify})"
     _info "当前端口: ${old_port}"
@@ -4001,6 +4269,7 @@ _modify_port() {
         
         # 4b. 更新 config.json 中主节点的 tag
         _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$tag_to_modify\") | .tag) = \"$new_tag\"" || return
+        _rename_singbox_inbound_ip_policy "$tag_to_modify" "$new_tag" || return
         
         # 4c. 迁移 metadata.json 中的 key (旧tag -> 新tag)
         if [ -f "$METADATA_FILE" ] && jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
@@ -4067,8 +4336,10 @@ _modify_port() {
                 _info "已移除端口跳跃映射。"
             fi
         elif [ "$hop_mode" = "native" ]; then
+            _remove_singbox_inbound_ip_policy_prefix "${tag_to_modify}-hop-" 2>/dev/null || true
             _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(select(.tag | startswith(\"${tag_to_modify}-hop-\") | not))" || return
             if [ -n "$new_tag" ] && [ "$new_tag" != "$tag_to_modify" ]; then
+                _remove_singbox_inbound_ip_policy_prefix "${new_tag}-hop-" 2>/dev/null || true
                 _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(select(.tag | startswith(\"${new_tag}-hop-\") | not))" || return
             fi
             if [ -n "$final_hop_info" ]; then
@@ -4088,6 +4359,12 @@ _modify_port() {
                 done
                 if [ "$(echo "$batch_array" | jq 'length')" -gt 0 ]; then
                     _atomic_modify_json "$CONFIG_FILE" ".inbounds += $batch_array" || return
+                    if [ -n "$allowed_inbound_ips" ]; then
+                        local rebuilt_hop_tag
+                        while IFS= read -r rebuilt_hop_tag; do
+                            [ -n "$rebuilt_hop_tag" ] && _apply_singbox_inbound_ip_policy "$rebuilt_hop_tag" "$allowed_inbound_ips" || return
+                        done < <(jq -r --arg prefix "${final_tag}-hop-" '.inbounds[]?.tag | select(startswith($prefix))' "$CONFIG_FILE" 2>/dev/null)
+                    fi
                 fi
                 _info "已重建原生端口跳跃子节点，范围: ${final_hop_info}"
                 if [ "$skipped" -gt 0 ]; then
@@ -4874,6 +5151,12 @@ _batch_create_nodes() {
     read -p "请输入批量节点绑定的IP地址 (回车默认: ${server_ip}): " custom_batch_ip
     batch_ip=${custom_batch_ip:-$server_ip}
     export BATCH_IP="$batch_ip"
+
+    _prompt_allowed_inbound_ips || return 1
+    local before_policy_tags=""
+    if [ -f "$CONFIG_FILE" ]; then
+        before_policy_tags=$(jq -r '.inbounds[]?.tag // empty' "$CONFIG_FILE" 2>/dev/null | tr '\n' ' ')
+    fi
     
     # 2.1 SNI 收集 (强制净化处理)
     export BATCH_SNI="$DEFAULT_SNI"
@@ -4975,7 +5258,11 @@ _batch_create_nodes() {
         fi
     done
 
+    _apply_singbox_policy_to_new_nodes "$before_policy_tags" "$ALLOWED_INBOUND_IPS" || \
+        _warn "部分批量节点的入站 IP 白名单写入失败，请检查配置文件。"
+
     unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_IP
+    unset ALLOWED_INBOUND_IPS
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
@@ -5026,6 +5313,15 @@ _show_add_node_menu() {
         return
     fi
 
+    local before_policy_tags=""
+    ALLOWED_INBOUND_IPS=""
+    if [[ "$choice" =~ ^[1-9]$ ]]; then
+        _prompt_allowed_inbound_ips || return
+        if [ -f "$CONFIG_FILE" ]; then
+            before_policy_tags=$(jq -r '.inbounds[]?.tag // empty' "$CONFIG_FILE" 2>/dev/null | tr '\n' ' ')
+        fi
+    fi
+
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
         2) _add_vless_ws_tls; action_result=$? ;;
@@ -5040,6 +5336,12 @@ _show_add_node_menu() {
         0) return ;;
         *) _error "无效输入，请重试。" ;;
     esac
+
+    if [ "$action_result" -eq 0 ] 2>/dev/null && [ -n "$ALLOWED_INBOUND_IPS" ]; then
+        _apply_singbox_policy_to_new_nodes "$before_policy_tags" "$ALLOWED_INBOUND_IPS" || \
+            _warn "节点已创建，但入站 IP 白名单写入失败，请检查配置文件。"
+    fi
+    unset ALLOWED_INBOUND_IPS
 
     if [ "$action_result" -eq 0 ] 2>/dev/null; then
         needs_restart=true
