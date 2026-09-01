@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="16"
+export SCRIPT_VERSION="17"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
@@ -2074,22 +2074,21 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
+        "type": "https",
         "tag": "dns-cloudflare",
-        "address": "https://1.1.1.1/dns-query",
-        "detour": "direct"
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query"
       },
       {
+        "type": "https",
         "tag": "dns-aliyun",
-        "address": "https://223.5.5.5/dns-query",
-        "detour": "direct"
+        "server": "223.5.5.5",
+        "server_port": 443,
+        "path": "/dns-query"
       }
     ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-cloudflare"
-      }
-    ],
+    "final": "dns-cloudflare",
     "strategy": "ipv4_only"
   },
   "inbounds": [],
@@ -2256,33 +2255,38 @@ _cleanup_legacy_config() {
 }
 
 _check_and_fix_dns() {
-    # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
-    # 并且全面升级为 DoH (阿里 + CF) 与 ipv4_only 策略防止被污染的域名解析打孔失败
+    # 热修复：迁移 sing-box 1.14 已移除的旧 DNS 服务器格式，并清除有问题的自动网卡探测。
     if [ ! -f "$CONFIG_FILE" ]; then return; fi
     
     local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
     local has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
+    local has_legacy_dns=$(jq 'any(.dns.servers[]?; type == "string" or (type == "object" and has("address")))' "$CONFIG_FILE" 2>/dev/null)
+    local has_legacy_dns_rule=$(jq 'any(.dns.rules[]?; type == "object" and has("outbound"))' "$CONFIG_FILE" 2>/dev/null)
+    local has_independent_cache=$(jq '.dns.independent_cache != null' "$CONFIG_FILE" 2>/dev/null)
     local needs_restart=false
     
-    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ]; then
-        _warn "检测到您的配置文件存在影响节点转发的底层隐患 (缺乏防污染 DNS / 启用了不良路由)，正在自动修复..."
+    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || \
+       [ "$has_legacy_dns" == "true" ] || [ "$has_legacy_dns_rule" == "true" ] || \
+       [ "$has_independent_cache" == "true" ]; then
+        _warn "检测到旧版或不完整的 DNS 配置，正在迁移到 sing-box 1.14 新格式..."
         
         local tmp_file="${CONFIG_FILE}.tmp"
-        # 1. 注入现代防污染 DNS 2. 移除自动网卡探测
-        jq '. + {
-            "dns": {
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_dns_$(date +%Y%m%d%H%M%S)"
+        jq '.dns = ((.dns // {}) + {
                 "servers": [
-                    {"tag": "dns-cloudflare", "address": "https://1.1.1.1/dns-query", "detour": "direct"},
-                    {"tag": "dns-aliyun", "address": "https://223.5.5.5/dns-query", "detour": "direct"}
+                    {"type": "https", "tag": "dns-cloudflare", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query"},
+                    {"type": "https", "tag": "dns-aliyun", "server": "223.5.5.5", "server_port": 443, "path": "/dns-query"}
                 ],
-                "rules": [{"outbound": "any", "server": "dns-cloudflare"}],
+                "final": "dns-cloudflare",
                 "strategy": "ipv4_only"
             }
-        } | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
+            | .rules = ((.rules // []) | map(select((type == "object" and has("outbound")) | not)))
+            | del(.independent_cache)
+        ) | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
         
         if [ $? -eq 0 ] && [ -s "$tmp_file" ]; then
             mv "$tmp_file" "$CONFIG_FILE"
-            _success "高级 DNS 与路由参数热修复完成！"
+            _success "DNS 已迁移至 sing-box 1.14 新格式，原配置已备份。"
             needs_restart=true
         else
             _error "高级修复应用失败！"
@@ -4566,6 +4570,7 @@ _do_update_singbox() {
             _info "检测到主配置文件缺失，正在初始化..."
             _initialize_config_files
         fi
+        _check_and_fix_dns || true
         _init_relay_config
         if [ ! -s "${SINGBOX_DIR}/relay.json" ]; then
             echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
