@@ -53,6 +53,9 @@
 | Shadowsocks | ✅ | ✅ | ✅ |
 | VLESS-TCP | ✅ | ❌ | ✅ |
 | SOCKS5 | ✅ | ✅ | ✅ |
+| Snell v5 | ✅ | ❌ | ❌ |
+
+> Snell 使用 sing-box 1.14.0+ 服务端与 Mihomo v5 客户端的共同兼容版本。支持 UDP、Mihomo `reuse` 以及可选 HTTP 混淆；Snell 没有统一的分享链接，请使用脚本输出的 Mihomo 配置或 `clash.yaml`。
 
 ### Xray 协议
 
@@ -345,3 +348,6 @@
 ### 2026.05.24
 - **SOCKS5 协议完善**：主脚本搭建的 SOCKS5 节点现支持生成标准 `socks://Base64(user:pass)@host:port#name` 分享链接，兼容 v2rayN、Shadowrocket 等主流客户端；查看节点也会同步输出该链接。
 - **SOCKS5 中转支持**：进阶脚本中，SOCKS5 节点可作为落地节点直接生成中转 Token；中转机也支持导入 `socks://` / `socks5://` 第三方链接（明文 user:pass 或 Base64 编码均可识别），通过 sing-box 的 socks outbound 转发，适合对接已有 SOCKS5 代理出口。
+
+### 2026.09.01
+- **新增 Snell v5 协议**：适配 sing-box 1.14.0+ Snell 入站与 Mihomo v5 客户端，支持随机/自定义 PSK、UDP、连接复用和 HTTP 混淆，并支持单节点及批量创建。

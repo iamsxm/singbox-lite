@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="15"
+export SCRIPT_VERSION="16"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
@@ -3594,6 +3594,84 @@ _add_shadowsocks_menu() {
     return 0
 }
 
+_add_snell() {
+    local current_ver ver_major ver_minor
+    current_ver=$(${SINGBOX_BIN} version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//')
+    ver_major="${current_ver%%.*}"
+    ver_minor="${current_ver#*.}"
+    ver_minor="${ver_minor%%.*}"
+    if ! [[ "$ver_major" =~ ^[0-9]+$ && "$ver_minor" =~ ^[0-9]+$ ]] || \
+       [ "$ver_major" -lt 1 ] || { [ "$ver_major" -eq 1 ] && [ "$ver_minor" -lt 14 ]; }; then
+        _error "Snell 入站需要 sing-box 1.14.0 或更高版本（当前: ${current_ver:-未知}）。"
+        _info "请先从主菜单更新 sing-box 核心。"
+        return 1
+    fi
+
+    local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
+    local port="" psk="" obfs_mode="none" obfs_host="" reuse="false"
+
+    if [ "$BATCH_MODE" = "true" ]; then
+        port="$BATCH_PORT"
+        obfs_mode="${BATCH_SNELL_OBFS:-none}"
+        obfs_host="${BATCH_SNELL_HOST:-www.bing.com}"
+        reuse="${BATCH_SNELL_REUSE:-false}"
+        psk=$(${SINGBOX_BIN} generate rand --hex 16)
+    else
+        _info "--- 添加 Snell v5 节点 ---"
+        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        node_ip=${custom_ip:-$server_ip}
+        while true; do
+            read -p "请输入监听端口: " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _check_port_conflict "$port" "tcp" && continue
+            break
+        done
+        read -p "请输入 PSK (回车则随机生成): " psk
+        psk=${psk:-$(${SINGBOX_BIN} generate rand --hex 16)}
+        read -p "是否启用 HTTP 混淆? (y/N): " enable_obfs
+        if [[ "$enable_obfs" == "y" || "$enable_obfs" == "Y" ]]; then
+            obfs_mode="http"
+            read -p "请输入 HTTP 混淆 Host (默认: www.bing.com): " obfs_host
+            obfs_host=${obfs_host:-www.bing.com}
+        fi
+        read -p "是否启用 Mihomo 连接复用 reuse? (y/N): " enable_reuse
+        [[ "$enable_reuse" == "y" || "$enable_reuse" == "Y" ]] && reuse="true"
+    fi
+
+    [ -z "$port" ] && { _error "Snell 监听端口为空。"; return 1; }
+    [ -z "$psk" ] && { _error "Snell PSK 不能为空。"; return 1; }
+
+    local tag="snell-in-${port}"
+    local name="Batch-Snell-v5-${port}"
+    if [ "$BATCH_MODE" != "true" ]; then
+        local default_name="Snell-v5-${port}"
+        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        name=${custom_name:-$default_name}
+    fi
+
+    local inbound_json
+    inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg psk "$psk" --arg obfs "$obfs_mode" \
+        '{"type":"snell","tag":$t,"listen":"::","listen_port":($p|tonumber),"version":5,"psk":$psk,"obfs_mode":$obfs}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+
+    local proxy_json
+    proxy_json=$(jq -n --arg n "$name" --arg s "$node_ip" --arg p "$port" --arg psk "$psk" \
+        --arg reuse "$reuse" --arg obfs "$obfs_mode" --arg host "$obfs_host" \
+        '{"name":$n,"type":"snell","server":$s,"port":($p|tonumber),"psk":$psk,"version":5,"udp":true,"reuse":($reuse == "true")}
+         | if $obfs == "http" then . + {"obfs-opts":{"mode":"http","host":$host}} else . end')
+    _add_node_to_yaml "$proxy_json"
+
+    local meta_json
+    meta_json=$(jq -n --arg psk "$psk" --arg obfs "$obfs_mode" --arg host "$obfs_host" --arg reuse "$reuse" \
+        '{version:5, psk:$psk, obfsMode:$obfs, reuse:($reuse == "true")} | if $obfs == "http" then .obfsHost=$host else . end')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+
+    _success "Snell v5 节点 [${name}] 添加成功!"
+    _info "Snell 没有统一的分享链接，请使用上方 Mihomo 节点配置或 clash.yaml。"
+    return 0
+}
+
 _add_socks() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
@@ -3787,6 +3865,11 @@ _view_nodes() {
                 local method password
                 IFS=$'\t' read -r method password <<< "$(echo "$node" | jq -r '[.method, .password] | @tsv')"
                 url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$display_name")"
+                ;;
+            "snell")
+                local snell_version snell_psk snell_obfs
+                IFS=$'\t' read -r snell_version snell_psk snell_obfs <<< "$(echo "$node" | jq -r '[.version, .psk, (.obfs_mode // "none")] | @tsv')"
+                _info "  类型: Snell v${snell_version}, 地址: $display_server, 端口: $port, PSK: $snell_psk, 混淆: $snell_obfs"
                 ;;
             "socks")
                 # [资源优化] 合并2次jq为1次
@@ -5123,6 +5206,7 @@ _batch_create_nodes() {
     local has_sni_req=false 
     local has_hy2=false     
     local has_ss=false      
+    local has_snell=false
     local ss_occurences=0
 
     for pid in $proto_ids; do
@@ -5138,6 +5222,7 @@ _batch_create_nodes() {
         [[ "$pid" =~ ^(5|7)$ ]] && has_complex=true
         [[ "$pid" =~ ^(1|4|5|6)$ ]] && has_sni_req=true
         [[ "$pid" == "5" ]] && has_hy2=true
+        [[ "$pid" == "10" ]] && has_snell=true
     done
 
     [ $proto_count -eq 0 ] && { _error "未选择任何协议"; return 1; }
@@ -5178,6 +5263,21 @@ _batch_create_nodes() {
             hy2_hop="true"
             read -p "请输入端口跳跃范围 (如 20000-30000): " hy2_hop_range
         fi
+    fi
+
+    # 2.3 Snell v5 专项
+    export BATCH_SNELL_OBFS="none"
+    export BATCH_SNELL_HOST="www.bing.com"
+    export BATCH_SNELL_REUSE="false"
+    if [ "$has_snell" = true ]; then
+        read -p "Snell v5 是否启用 HTTP 混淆? (y/N): " snell_obfs_choice
+        if [[ "$snell_obfs_choice" == "y" || "$snell_obfs_choice" == "Y" ]]; then
+            BATCH_SNELL_OBFS="http"
+            read -p "请输入 Snell HTTP 混淆 Host (默认: $BATCH_SNELL_HOST): " snell_host_input
+            [ -n "$snell_host_input" ] && BATCH_SNELL_HOST="$snell_host_input"
+        fi
+        read -p "Snell Mihomo 客户端是否启用 reuse? (y/N): " snell_reuse_choice
+        [[ "$snell_reuse_choice" == "y" || "$snell_reuse_choice" == "Y" ]] && BATCH_SNELL_REUSE="true"
     fi
 
     # 2.4 SS 专项 (支持多选)
@@ -5253,6 +5353,7 @@ _batch_create_nodes() {
                 6) _add_tuic ;;
                 8) _add_vless_tcp ;;
                 9) _add_socks ;;
+                10) _add_snell ;;
             esac
             ((bulk_idx++))
         fi
@@ -5262,6 +5363,7 @@ _batch_create_nodes() {
         _warn "部分批量节点的入站 IP 白名单写入失败，请检查配置文件。"
 
     unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_IP
+    unset BATCH_SNELL_OBFS BATCH_SNELL_HOST BATCH_SNELL_REUSE
     unset ALLOWED_INBOUND_IPS
     
     echo ""
@@ -5295,17 +5397,18 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[7]${NC} Shadowsocks"
     echo -e "    ${GREEN}[8]${NC} VLESS (TCP)"
     echo -e "    ${GREEN}[9]${NC} SOCKS5"
+    echo -e "   ${GREEN}[10]${NC} Snell v5 (sing-box 1.14+ / Mihomo)"
     echo ""
     
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[10]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[11]${NC} 批量创建节点"
     echo ""
     
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     
-    read -p "  请输入选项 [0-10]: " choice
+    read -p "  请输入选项 [0-11]: " choice
 
     # 如果输入包含逗号或空格，自动进入批量处理模式
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
@@ -5315,7 +5418,7 @@ _show_add_node_menu() {
 
     local before_policy_tags=""
     ALLOWED_INBOUND_IPS=""
-    if [[ "$choice" =~ ^[1-9]$ ]]; then
+    if [[ "$choice" =~ ^([1-9]|10)$ ]]; then
         _prompt_allowed_inbound_ips || return
         if [ -f "$CONFIG_FILE" ]; then
             before_policy_tags=$(jq -r '.inbounds[]?.tag // empty' "$CONFIG_FILE" 2>/dev/null | tr '\n' ' ')
@@ -5332,7 +5435,8 @@ _show_add_node_menu() {
         7) _add_shadowsocks_menu; action_result=$? ;;
         8) _add_vless_tcp; action_result=$? ;;
         9) _add_socks; action_result=$? ;;
-        10) _batch_create_nodes; return ;;
+        10) _add_snell; action_result=$? ;;
+        11) _batch_create_nodes; return ;;
         0) return ;;
         *) _error "无效输入，请重试。" ;;
     esac
