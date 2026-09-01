@@ -1,8 +1,19 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="18"
+export SCRIPT_VERSION="19"
 export DEFAULT_SNI="www.amd.com"
+SNI_CANDIDATES=(
+    "www.apple.com"
+    "www.microsoft.com"
+    "www.amazon.com"
+    "www.bing.com"
+    "www.samsung.com"
+    "www.adobe.com"
+    "www.mozilla.org"
+    "www.amd.com"
+    "www.nvidia.com"
+)
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
@@ -25,6 +36,27 @@ _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
 _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _warning() { _warn "$1"; } # 别名兼容
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
+
+_random_sni() {
+    local count=${#SNI_CANDIDATES[@]}
+    [ "$count" -gt 0 ] || { printf '%s' "$DEFAULT_SNI"; return; }
+    printf '%s' "${SNI_CANDIDATES[$((RANDOM % count))]}"
+}
+
+_is_random_sni_input() {
+    local input="${1//[[:space:]]/}"
+    [[ "${input,,}" =~ ^(r|random|随机)$ ]]
+}
+
+_resolve_sni_input() {
+    local input="${1//[[:space:]]/}"
+    local fallback="${2:-$DEFAULT_SNI}"
+    case "${input,,}" in
+        r|random|随机) _random_sni ;;
+        "") printf '%s' "$fallback" ;;
+        *) printf '%s' "$input" ;;
+    esac
+}
 
 # 检查 root 权限
 _check_root() {
@@ -2890,8 +2922,9 @@ _add_anytls() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        read -p "请输入伪装域名/SNI (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名/SNI (默认: $DEFAULT_SNI，输入 r 随机): " camouflage_domain
+        server_name=$(_resolve_sni_input "$camouflage_domain")
+        _is_random_sni_input "$camouflage_domain" && _info "已随机选择 SNI: $server_name"
     fi
     
     # --- 步骤 4: 证书选择 ---
@@ -2905,6 +2938,10 @@ _add_anytls() {
         echo "  2) 手动上传证书文件 (Cloudflare源证书等)"
         read -p "请选择 [1-2] (默认: 1): " cert_choice
         cert_choice=${cert_choice:-1}
+        if [ "$cert_choice" == "2" ] && _is_random_sni_input "$camouflage_domain"; then
+            _error "手动上传证书时，SNI 必须与证书域名匹配，不能使用随机选项。"
+            return 1
+        fi
     fi
     
     local cert_path=""
@@ -3051,8 +3088,9 @@ _add_vless_reality() {
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: $DEFAULT_SNI，输入 r 随机): " camouflage_domain
+        server_name=$(_resolve_sni_input "$camouflage_domain")
+        _is_random_sni_input "$camouflage_domain" && _info "已随机选择 SNI: $server_name"
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -3168,8 +3206,9 @@ _add_hysteria2() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: $DEFAULT_SNI，输入 r 随机): " camouflage_domain
+        server_name=$(_resolve_sni_input "$camouflage_domain")
+        _is_random_sni_input "$camouflage_domain" && _info "已随机选择 SNI: $server_name"
     fi
 
     local tag="hy2-in-${port}"
@@ -3346,8 +3385,9 @@ _add_tuic() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: $DEFAULT_SNI，输入 r 随机): " camouflage_domain
+        server_name=$(_resolve_sni_input "$camouflage_domain")
+        _is_random_sni_input "$camouflage_domain" && _info "已随机选择 SNI: $server_name"
     fi
 
     local tag="tuic-in-${port}"
@@ -3466,8 +3506,9 @@ _add_shadowsocks_menu() {
     local shadowtls_sni="www.amd.com"
     if [ "$use_shadowtls" == "true" ]; then
         shadowtls_password=$(${SINGBOX_BIN} generate rand --hex 16)
-        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.amd.com): " custom_sni
-        shadowtls_sni=${custom_sni:-www.amd.com}
+        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: $DEFAULT_SNI，输入 r 随机): " custom_sni
+        shadowtls_sni=$(_resolve_sni_input "$custom_sni")
+        _is_random_sni_input "$custom_sni" && _info "已随机选择 SNI: $shadowtls_sni"
     fi
 
     local tag="${name_prefix}-in-${port}"
@@ -5248,9 +5289,9 @@ _batch_create_nodes() {
     # 2.1 SNI 收集 (强制净化处理)
     export BATCH_SNI="$DEFAULT_SNI"
     if [ "$has_sni_req" = true ]; then
-        read -p "请输入统一伪装域名 (SNI) [默认: $BATCH_SNI]: " input_sni
-        input_sni=$(echo "$input_sni" | xargs)
-        [ -n "$input_sni" ] && BATCH_SNI="$input_sni"
+        read -p "请输入统一伪装域名 (SNI) [默认: $BATCH_SNI，输入 r 随机]: " input_sni
+        BATCH_SNI=$(_resolve_sni_input "$input_sni" "$BATCH_SNI")
+        _is_random_sni_input "$input_sni" && _info "已随机选择统一 SNI: $BATCH_SNI"
     fi
 
     # 2.2 Hy2 专项

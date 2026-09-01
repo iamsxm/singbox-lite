@@ -9,7 +9,7 @@
 - 🚀 **一键安装** - 自动检测系统环境（systemd/OpenRC），自动安装依赖
 - 📦 **多协议支持** - 支持多种 sing-box 代理协议以及 Argo 临时隧道和固定隧道节点的部署
 - 🦘 **端口跳跃** - 支持 LXC/NAT 环境下的 Hysteria2 端口跳跃（应用层多端口监听）
-- ⚡ **批量创建** - 智能批量部署，支持自定义 SNI 和端口冲突检测
+- ⚡ **批量创建** - 智能批量部署，支持自定义/随机 SNI 和端口冲突检测
 - 🔄 **智能管理** - 列表自动隐藏辅助节点，支持级联删除
 - 🌐 **IPv6 完美支持** - 自动处理 IPv6 地址格式
 - 🎯 **自定义名称** - 所有节点支持自定义命名
@@ -350,6 +350,7 @@
 - **SOCKS5 中转支持**：进阶脚本中，SOCKS5 节点可作为落地节点直接生成中转 Token；中转机也支持导入 `socks://` / `socks5://` 第三方链接（明文 user:pass 或 Base64 编码均可识别），通过 sing-box 的 socks outbound 转发，适合对接已有 SOCKS5 代理出口。
 
 ### 2026.09.01
+- **新增随机 SNI 选项**：Reality、AnyTLS（自签名证书）、Hysteria2、TUIC、ShadowTLS 及批量创建可输入 `r`，从参考 [Tranco 热门域名榜单](https://tranco-list.eu/)整理的常用 HTTPS 厂商域名池中随机选择；需要真实证书匹配的 WS/TLS 节点不启用随机选项。
 - **新增 Snell v5 协议**：适配 sing-box 1.14.0+ Snell 入站与 Mihomo v5 客户端，支持随机/自定义 PSK、UDP、连接复用和 HTTP 混淆，并支持单节点及批量创建。
 - **迁移 sing-box 1.14 DNS 配置**：新配置改用显式 HTTPS DNS 服务器格式；已有旧版 `address` 服务器、`outbound` DNS 规则和 `independent_cache` 会在启动脚本时自动备份并迁移。
 - **补齐默认域名解析器**：自动写入 `route.default_domain_resolver`，并移除已失效的废弃功能环境变量，使配置可直接通过 sing-box 1.14 检查。
