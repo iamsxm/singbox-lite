@@ -1,18 +1,13 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="17"
+export SCRIPT_VERSION="18"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/iamsxm/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
-
-# 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
-export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
-export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
-export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
 
 # --- 核心工具函数 ---
 
@@ -1857,9 +1852,6 @@ After=network.target nss-lookup.target
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 Environment="GOGC=${go_gc}"
-Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
-Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
-Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -1884,7 +1876,7 @@ command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${go_gc} --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${go_gc}"
 respawn_delay=3
 respawn_max=0
 
@@ -2100,6 +2092,7 @@ _initialize_config_files() {
   ],
   "route": {
     "rules": [],
+    "default_domain_resolver": "dns-cloudflare",
     "final": "direct"
   }
 }
@@ -2263,11 +2256,12 @@ _check_and_fix_dns() {
     local has_legacy_dns=$(jq 'any(.dns.servers[]?; type == "string" or (type == "object" and has("address")))' "$CONFIG_FILE" 2>/dev/null)
     local has_legacy_dns_rule=$(jq 'any(.dns.rules[]?; type == "object" and has("outbound"))' "$CONFIG_FILE" 2>/dev/null)
     local has_independent_cache=$(jq '.dns.independent_cache != null' "$CONFIG_FILE" 2>/dev/null)
+    local has_default_resolver=$(jq '.route.default_domain_resolver == "dns-cloudflare"' "$CONFIG_FILE" 2>/dev/null)
     local needs_restart=false
     
     if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || \
        [ "$has_legacy_dns" == "true" ] || [ "$has_legacy_dns_rule" == "true" ] || \
-       [ "$has_independent_cache" == "true" ]; then
+       [ "$has_independent_cache" == "true" ] || [ "$has_default_resolver" != "true" ]; then
         _warn "检测到旧版或不完整的 DNS 配置，正在迁移到 sing-box 1.14 新格式..."
         
         local tmp_file="${CONFIG_FILE}.tmp"
@@ -2282,7 +2276,10 @@ _check_and_fix_dns() {
             }
             | .rules = ((.rules // []) | map(select((type == "object" and has("outbound")) | not)))
             | del(.independent_cache)
-        ) | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
+        )
+        | .route = (.route // {})
+        | .route.default_domain_resolver = "dns-cloudflare"
+        | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
         
         if [ $? -eq 0 ] && [ -s "$tmp_file" ]; then
             mv "$tmp_file" "$CONFIG_FILE"

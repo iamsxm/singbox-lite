@@ -352,3 +352,4 @@
 ### 2026.09.01
 - **新增 Snell v5 协议**：适配 sing-box 1.14.0+ Snell 入站与 Mihomo v5 客户端，支持随机/自定义 PSK、UDP、连接复用和 HTTP 混淆，并支持单节点及批量创建。
 - **迁移 sing-box 1.14 DNS 配置**：新配置改用显式 HTTPS DNS 服务器格式；已有旧版 `address` 服务器、`outbound` DNS 规则和 `independent_cache` 会在启动脚本时自动备份并迁移。
+- **补齐默认域名解析器**：自动写入 `route.default_domain_resolver`，并移除已失效的废弃功能环境变量，使配置可直接通过 sing-box 1.14 检查。
