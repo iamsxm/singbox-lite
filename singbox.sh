@@ -1,62 +1,39 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="19"
-export DEFAULT_SNI="www.amd.com"
-SNI_CANDIDATES=(
-    "www.apple.com"
-    "www.microsoft.com"
-    "www.amazon.com"
-    "www.bing.com"
-    "www.samsung.com"
-    "www.adobe.com"
-    "www.mozilla.org"
-    "www.amd.com"
-    "www.nvidia.com"
-)
+export SCRIPT_VERSION="20"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/iamsxm/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
-# --- 核心工具函数 ---
+# --- 加载共享函数库 lib_common.sh ---
+# 公共函数 (颜色/编解码/白名单校验/原子修改/端口检测等) 统一维护在共享库，
+# 查找顺序: 主脚本同目录 → 配置目录；两处均无则自动下载到配置目录
+if [ -z "${_LIB_COMMON_SOURCED:-}" ]; then
+    _lib_common=""
+    for _d in "$SCRIPT_DIR" "$SINGBOX_DIR"; do
+        [ -f "${_d}/lib_common.sh" ] && { _lib_common="${_d}/lib_common.sh"; break; }
+    done
+    if [ -z "$_lib_common" ]; then
+        _lib_common="${SINGBOX_DIR}/lib_common.sh"
+        mkdir -p "$SINGBOX_DIR" 2>/dev/null
+        if ! { curl -fsSL --max-time 15 "${GITHUB_RAW_BASE}/lib_common.sh" -o "${_lib_common}.tmp" 2>/dev/null || wget -qO "${_lib_common}.tmp" "${GITHUB_RAW_BASE}/lib_common.sh" 2>/dev/null; } || [ ! -s "${_lib_common}.tmp" ]; then
+            rm -f "${_lib_common}.tmp"
+            echo "[错误] 缺少共享函数库 lib_common.sh 且自动下载失败。" >&2
+            echo "       请检查网络后重试，或手动将其放置到 ${SINGBOX_DIR}/ 后再运行。" >&2
+            exit 1
+        fi
+        mv -f "${_lib_common}.tmp" "$_lib_common"
+        . "$_lib_common"
+        _info "已自动下载共享函数库 lib_common.sh"
+    else
+        . "$_lib_common"
+    fi
+fi
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-ORANGE='\033[0;33m'
-
-# 打印消息函数
-_info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
-_success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
-_warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
-_warning() { _warn "$1"; } # 别名兼容
-_error() { echo -e "${RED}[错误] $1${NC}" >&2; }
-
-_random_sni() {
-    local count=${#SNI_CANDIDATES[@]}
-    [ "$count" -gt 0 ] || { printf '%s' "$DEFAULT_SNI"; return; }
-    printf '%s' "${SNI_CANDIDATES[$((RANDOM % count))]}"
-}
-
-_is_random_sni_input() {
-    local input="${1//[[:space:]]/}"
-    [[ "${input,,}" =~ ^(r|random|随机)$ ]]
-}
-
-_resolve_sni_input() {
-    local input="${1//[[:space:]]/}"
-    local fallback="${2:-$DEFAULT_SNI}"
-    case "${input,,}" in
-        r|random|随机) _random_sni ;;
-        "") printf '%s' "$fallback" ;;
-        *) printf '%s' "$input" ;;
-    esac
-}
+# --- 核心工具函数 (公共工具统一维护在 lib_common.sh) ---
 
 # 检查 root 权限
 _check_root() {
@@ -66,137 +43,7 @@ _check_root() {
     fi
 }
 
-# 编解码器 (纯 Bash 稳健实现)
-_url_decode() {
-    local data="${1//+/ }"
-    printf '%b' "${data//%/\\x}"
-}
-_url_encode() {
-    # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
-    # jq 是必装依赖，@uri 以字节为单位执行标准 percent-encoding
-    printf '%s' "$1" | jq -sRr @uri
-}
-
-_ss_base64_encode() {
-    # Shadowsocks SIP002 规范要求 Base64 编码不带填充 (No Padding)
-    printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
-}
-
-# 公网 IP 获取 (带全局缓存)
-_get_public_ip() {
-    [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
-    local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
-    [ -z "$ip" ] && ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s6 --max-time 2 ipinfo.io/ip 2>/dev/null)
-    server_ip="$ip"
-    echo "$ip"
-}
-_get_ip() { _get_public_ip; } # 别名兼容
-
-# ---------------- 入站来源 IP 白名单 ----------------
-# 将单个 IP 统一转换为 CIDR，便于 sing-box/Xray 使用同一套输入格式。
-_validate_inbound_ipv6_part() {
-    local part="$1"
-    [ -z "$part" ] && return 0
-    [[ "$part" != :* && "$part" != *: ]] || return 1
-
-    local hextets=()
-    IFS=':' read -r -a hextets <<< "$part"
-    [ "${#hextets[@]}" -gt 0 ] || return 1
-    local hextet
-    for hextet in "${hextets[@]}"; do
-        [[ "$hextet" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
-    done
-    return 0
-}
-
-_normalize_inbound_ip() {
-    local value="$1"
-    local address="" prefix=""
-    value="${value#[}"
-    value="${value%]}"
-
-    if [[ "$value" == */* ]]; then
-        address="${value%%/*}"
-        prefix="${value#*/}"
-        [[ "$prefix" != */* ]] || return 1
-    else
-        address="$value"
-    fi
-
-    if [[ "$address" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-        local octets=()
-        IFS='.' read -r -a octets <<< "$address"
-        [ "${#octets[@]}" -eq 4 ] || return 1
-        local octet
-        for octet in "${octets[@]}"; do
-            [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
-            [ "$((10#$octet))" -le 255 ] || return 1
-        done
-        [ -z "$prefix" ] && prefix=32
-        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
-        [ "$((10#$prefix))" -le 32 ] || return 1
-        printf '%d.%d.%d.%d/%d' "$((10#${octets[0]}))" "$((10#${octets[1]}))" "$((10#${octets[2]}))" "$((10#${octets[3]}))" "$((10#$prefix))"
-        return 0
-    fi
-
-    [[ "$address" == *:* ]] || return 1
-    [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
-    [ -z "$prefix" ] && prefix=128
-    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
-    [ "$((10#$prefix))" -le 128 ] || return 1
-
-    local left="" right="" left_count=0 right_count=0 total=0
-    if [[ "$address" == *::* ]]; then
-        # IPv6 只能有一个压缩段，且压缩段至少代表一个 hextet。
-        [[ "${address#*::}" != *::* ]] || return 1
-        left="${address%%::*}"
-        right="${address#*::}"
-        _validate_inbound_ipv6_part "$left" || return 1
-        _validate_inbound_ipv6_part "$right" || return 1
-        [ -n "$left" ] && left_count=$(awk -F: '{print NF}' <<< "$left")
-        [ -n "$right" ] && right_count=$(awk -F: '{print NF}' <<< "$right")
-        total=$((left_count + right_count))
-        [ "$total" -le 7 ] || return 1
-    else
-        _validate_inbound_ipv6_part "$address" || return 1
-        total=$(awk -F: '{print NF}' <<< "$address")
-        [ "$total" -eq 8 ] || return 1
-    fi
-    printf '%s/%d' "$address" "$((10#$prefix))"
-}
-
-_normalize_inbound_ip_list() {
-    local raw="${1//,/ }"
-    local compact="${raw//[[:space:]]/}"
-    [ -n "$compact" ] || return 0
-
-    local values=()
-    read -r -a values <<< "$raw"
-    [ "${#values[@]}" -gt 0 ] || return 1
-
-    local value normalized result=()
-    for value in "${values[@]}"; do
-        normalized=$(_normalize_inbound_ip "$value") || return 1
-        result+=("$normalized")
-    done
-    local IFS=' '
-    printf '%s' "${result[*]}"
-}
-
-_prompt_allowed_inbound_ips() {
-    ALLOWED_INBOUND_IPS=""
-    local raw="" normalized=""
-    while true; do
-        read -p "允许的入站来源 IP/CIDR（多个用逗号或空格分隔，留空不限）: " raw
-        normalized=$(_normalize_inbound_ip_list "$raw")
-        if [ $? -eq 0 ]; then
-            ALLOWED_INBOUND_IPS="$normalized"
-            [ -n "$normalized" ] && _info "已启用入站来源 IP 白名单: ${normalized// /, }"
-            return 0
-        fi
-        _error "IP/CIDR 格式无效，请重新输入。例如: 203.0.113.10, 2001:db8::/32"
-    done
-}
+# ---------------- 入站来源 IP 白名单 (校验与交互已移入 lib_common.sh) ----------------
 
 _apply_singbox_inbound_ip_policy() {
     local tag="$1" ips="$2"
@@ -349,49 +196,7 @@ _apply_singbox_policy_to_new_nodes() {
     fi
 }
 
-# 系统环境检测
-_detect_init_system() {
-    if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then
-        export INIT_SYSTEM="openrc"
-        export SERVICE_FILE="/etc/init.d/sing-box"
-    elif command -v systemctl &>/dev/null; then
-        export INIT_SYSTEM="systemd"
-        export SERVICE_FILE="/etc/systemd/system/sing-box.service"
-    else
-        export INIT_SYSTEM="unknown"
-        export SERVICE_FILE=""
-    fi
-}
-
-# 端口占用检查
-_check_port_occupied() {
-    local port=$1
-    local proto=${2:-tcp}
-    local hex_port
-    if [[ "$proto" == "tcp" ]]; then
-        if command -v ss &>/dev/null; then
-            ss -lnpt | grep -q ":${port} " && return 0
-        elif command -v netstat &>/dev/null; then
-            netstat -lnpt | grep -q ":${port} " && return 0
-        fi
-    else
-        if command -v ss &>/dev/null; then
-            ss -lnpu | grep -q ":${port} " && return 0
-        elif command -v netstat &>/dev/null; then
-            netstat -lnpu | grep -q ":${port} " && return 0
-        fi
-    fi
-
-    # 精简 Alpine/Podman 可能没有 ss/netstat，直接读取 /proc/net 保证端口检测仍可工作
-    hex_port=$(printf '%04X' "$port" 2>/dev/null)
-    [ -z "$hex_port" ] && return 1
-    if [[ "$proto" == "tcp" ]]; then
-        awk -v p="$hex_port" '$2 ~ ":" p "$" {found=1} END{exit !found}' /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0
-    else
-        awk -v p="$hex_port" '$2 ~ ":" p "$" {found=1} END{exit !found}' /proc/net/udp /proc/net/udp6 2>/dev/null && return 0
-    fi
-    return 1
-}
+# 系统环境检测与端口占用检查已移入 lib_common.sh
 
 # 配置文件端口扫描 (预检是否已被本程序占用)
 _check_port_in_config() {
@@ -416,28 +221,7 @@ _check_port_conflict() {
     return 1
 }
 
-# IPTables 规则持久化 (跨 Debian/Alpine 双发行版兼容)
-_save_iptables_rules() {
-    if command -v netfilter-persistent &>/dev/null; then
-        # Debian/Ubuntu: 使用 netfilter-persistent 统一持久化 (含 v4+v6)
-        netfilter-persistent save >/dev/null 2>&1
-    else
-        # Alpine / 通用方案: 分别保存 v4 和 v6 规则到标准路径
-        if command -v iptables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        fi
-        if command -v ip6tables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-        fi
-    fi
-    # Alpine OpenRC: 尝试使用 rc-service 保存
-    if command -v rc-service &>/dev/null; then
-        rc-service iptables save 2>/dev/null
-        rc-service ip6tables save 2>/dev/null
-    fi
-}
+# IPTables 规则持久化已移入 lib_common.sh
 
 # 公网 IP 初始化
 _init_server_ip() {
@@ -477,43 +261,7 @@ _manage_service() {
     esac
 }
 
-# 智能包管理
-_pkg_install() {
-    local pkgs="$*"
-    [ -z "$pkgs" ] && return 0
-    if command -v apk &>/dev/null; then
-        apk add --no-cache $pkgs >/dev/null 2>&1
-    elif command -v apt-get &>/dev/null; then
-        # 全新 LXC/容器上 apt 缓存可能为空，必须先 update
-        if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
-            apt-get update -qq >/dev/null 2>&1
-        fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-            # 兜底：如果安装失败，强制刷新索引后重试
-            apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
-        }
-    elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
-    elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
-    fi
-}
-
-# 原子修改 JSON/YAML 文件
-_atomic_modify_json() {
-    local file="$1" filter="$2"
-    [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp"
-    if jq "$filter" "$file" > "$tmp"; then mv "$tmp" "$file"
-    else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
-}
-_atomic_modify_yaml() {
-    local file="$1" filter="$2"
-    [ ! -f "$file" ] && return 1
-    _install_yq || return 1
-    cp "$file" "${file}.tmp"
-    if ${YQ_BINARY} eval "$filter" -i "$file"; then rm "${file}.tmp"
-    else _error "修改YAML失败: $file"; mv "${file}.tmp" "$file"; return 1; fi
-}
+# 包管理与原子 JSON/YAML 修改已移入 lib_common.sh
 
 # --- 资源与环境管理 ---
 
@@ -542,78 +290,11 @@ _sync_system_time() {
     _info "当前时间：$(date)"
 }
 
-# Clash YAML 节点管理
-_get_proxy_field() {
-    local proxy_name="$1" field="$2"
-    _install_yq || return 1
-    export PROXY_NAME="$proxy_name"
-    ${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME)) | '"$field" "${CLASH_YAML_FILE}" 2>/dev/null | head -n 1
-}
-_add_node_to_yaml() {
-    local proxy_json="$1"
-    _install_yq || return 1
-    local proxy_name=$(echo "$proxy_json" | jq -r .name)
-    _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies |= . + [${proxy_json}] | .proxies |= unique_by(.name)"
-    export PROXY_NAME="$proxy_name"
-    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + [env(PROXY_NAME)] | .proxies |= unique)' -i "$CLASH_YAML_FILE"
-    _show_mihomo_proxy_line "$proxy_json"
-}
-# 打印 mihomo / Clash.Meta 单行节点配置 (YAML 兼容的 JSON flow style)
-# 可直接粘贴到 mihomo 配置的 proxies 列表下，或作为 proxy-providers 内容使用
-_show_mihomo_proxy_line() {
-    local proxy_json="$1"
-    [ -z "$proxy_json" ] && return
-    local compact=$(echo "$proxy_json" | jq -c .)
-    [ -z "$compact" ] && return
-    echo ""
-    echo -e "${YELLOW}═══════════════ mihomo / Clash.Meta 节点 ═══════════════${NC}"
-    echo -e "${CYAN}- ${compact}${NC}"
-    echo -e "${YELLOW}════════════════════════════════════════════════════════${NC}"
-}
-_remove_node_from_yaml() {
-    local proxy_name="$1"
-    _install_yq || return 1
-    export PROXY_NAME="$proxy_name"
-    ${YQ_BINARY} eval 'del(.proxies[] | select(.name == env(PROXY_NAME)))' -i "$CLASH_YAML_FILE"
-    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' -i "$CLASH_YAML_FILE"
-}
-_find_proxy_name() {
-    local port="$1" type="$2" proxy_name=""
-    _install_yq || return 1
-    local proxy_obj=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} 2>/dev/null | head -n 1)
-    [ -n "$proxy_obj" ] && proxy_name=$(echo "$proxy_obj" | ${YQ_BINARY} eval '.name' -)
-    [ -z "$proxy_name" ] && proxy_name=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} 2>/dev/null | grep -i "${type:-.}" | head -n 1)
-    echo "$proxy_name"
-}
+# Clash YAML 节点管理与查找缓存已移入 lib_common.sh
+# (_get_proxy_field / _add_node_to_yaml / _remove_node_from_yaml /
+#  _find_proxy_name / _show_mihomo_proxy_line 均由共享库提供)
 
-# 获取真实可用内存上限，优先读取 cgroup 限额以适配 Docker/Podman 低内存容器
-_get_total_mem_mb() {
-    local total_mem_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-    local cgroup_limit=""
-
-    [ -z "$total_mem_mb" ] && total_mem_mb=128
-
-    if [ -r /sys/fs/cgroup/memory.max ]; then
-        cgroup_limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
-        if [ "$cgroup_limit" != "max" ] && [ -n "$cgroup_limit" ]; then
-            total_mem_mb=$((cgroup_limit / 1024 / 1024))
-        fi
-    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-        cgroup_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
-        if [ -n "$cgroup_limit" ] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
-            total_mem_mb=$((cgroup_limit / 1024 / 1024))
-        fi
-    fi
-
-    [ "$total_mem_mb" -lt 16 ] && total_mem_mb=16
-    echo "$total_mem_mb"
-}
-
-# 判断是否为低内存环境；64M Podman/Alpine 会走更保守的依赖和运行时策略
-_is_low_mem_env() {
-    local total_mem_mb=$(_get_total_mem_mb)
-    [ "$total_mem_mb" -le 96 ]
-}
+# 内存环境探测 (_get_total_mem_mb / _is_low_mem_env) 已移入 lib_common.sh
 
 # 内存限额计算
 _get_mem_limit() {
@@ -648,36 +329,9 @@ _get_go_gc() {
     fi
 }
 
-# 安装阶段会产生较多文件缓存，低内存容器中尽力释放；失败不影响主流程
-_release_install_cache() {
-    sync 2>/dev/null || true
-    if [ -w /proc/sys/vm/drop_caches ]; then
-        if { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null; then
-            _info "已尝试释放安装产生的文件缓存。"
-        fi
-    fi
-    return 0
-}
-
-# 安装 yq
-_install_yq() {
-    if ! command -v yq &>/dev/null; then
-        _info "安装 yq..."
-        local arch=$(uname -m)
-        case $arch in x86_64|amd64) arch='amd64' ;; aarch64|arm64) arch='arm64' ;; *) arch='amd64' ;; esac
-        mkdir -p "$(dirname "$YQ_BINARY")" || return 1
-        if ! wget -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch"; then
-            rm -f "$YQ_BINARY"
-            _error "yq 下载失败。"
-            return 1
-        fi
-        chmod +x "$YQ_BINARY" || return 1
-        _release_install_cache
-    fi
-}
+# 缓存释放与 yq 安装已移入 lib_common.sh
 
 # --- 核心变量定义 ---
-export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
 export YQ_BINARY="/usr/local/bin/yq"
 export CONFIG_FILE="${SINGBOX_DIR}/config.json"
@@ -687,12 +341,12 @@ export ARGO_METADATA_FILE="${SINGBOX_DIR}/argo_metadata.json"
 export LOG_FILE="/var/log/sing-box.log"
 export PID_FILE="/tmp/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
+export SINGBOX_DIR
 _detect_init_system
-[ "$INIT_SYSTEM" == "openrc" ] && export SERVICE_FILE="/etc/init.d/sing-box" || export SERVICE_FILE="/etc/systemd/system/sing-box.service"
 
+# 向子脚本导出公共函数 (子脚本自身也会 source lib_common.sh，此处兼容磁盘上的旧版子脚本)
 export -f _info _success _warn _warning _error _url_encode _url_decode _get_public_ip _detect_init_system _sync_system_time _release_install_cache _install_yq _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_total_mem_mb _is_low_mem_env _get_mem_limit _get_go_gc _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _show_mihomo_proxy_line
 
-server_ip=""
 BATCH_MODE=false
 trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
 # 依赖安装
@@ -1034,8 +688,8 @@ _stop_all_argo_tunnels() {
         port=${port%.pid}
         _stop_argo_tunnel "$port"
     done
-    # 保底清理
-    pkill -f "cloudflared" 2>/dev/null
+    # 注意: 仅停止本脚本通过 pid 文件管理的隧道，不再 blanket pkill，
+    # 避免误杀机器上由其他程序启动的 cloudflared 进程
 }
 
 # ============================================================
@@ -1613,20 +1267,25 @@ _restart_argo_tunnel_menu() {
 # --- Argo 守护进程逻辑 ---
 
 _argo_keepalive() {
-    # --- 性能优化: 互斥锁 ---
+    # --- 互斥锁: 优先 flock 原子加锁 (无 TOCTOU 竞态)，无 flock 时回退旧式 PID 检查 ---
     local lock_file="/tmp/singbox_keepalive.lock"
-    if [ -f "$lock_file" ]; then
-        local pid=$(cat "$lock_file")
-        if kill -0 "$pid" 2>/dev/null; then
-            # 进程仍在运行，跳过本次执行
-            return
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$lock_file" 2>/dev/null || return 0
+        flock -n 9 || return 0
+    else
+        if [ -f "$lock_file" ]; then
+            local pid=$(cat "$lock_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                # 进程仍在运行，跳过本次执行
+                return 0
+            fi
         fi
+        echo "$$" > "$lock_file"
+        # 确保退出时删除锁
+        trap 'rm -f "$lock_file"' RETURN EXIT
     fi
-    echo "$$" > "$lock_file"
-    # 确保退出时删除锁
-    trap 'rm -f "$lock_file"' RETURN EXIT
 
-    # --- 性能优化: 日志轮转 (10MB) ---
+    # --- 日志轮转 (10MB) ---
     local max_size=$((10 * 1024 * 1024))
     for log in "$LOG_FILE" "$ARGO_LOG_FILE"; do
         if [ -f "$log" ] && [ $(stat -c%s "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
@@ -1634,9 +1293,9 @@ _argo_keepalive() {
         fi
     done
 
-    # 如果元数据文件不存在或为空，不需要守护
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
-        return
+    # 快速路径: 无 Argo 节点时用 grep 代替 jq 判断，避免每次唤醒都启动 jq 进程
+    if [ ! -f "$ARGO_METADATA_FILE" ] || ! grep -q '"argo-' "$ARGO_METADATA_FILE" 2>/dev/null; then
+        return 0
     fi
 
     # 遍历所有节点
@@ -1691,14 +1350,14 @@ _argo_keepalive() {
 }
 
 _enable_argo_watchdog() {
-    # 检查 crontab 是否已有任务
-    local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
-    
+    # 检查 crontab 是否已有任务 (每 2 分钟巡检一次，降低低配 VPS 的唤醒开销)
+    local job="*/2 * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
+
     if ! crontab -l 2>/dev/null | grep -Fq "$job"; then
         _info "正在添加后台守护进程 (Watchdog)..."
         (crontab -l 2>/dev/null; echo "$job") | crontab -
         if [ $? -eq 0 ]; then
-            _success "守护进程已启用！(每分钟检查并自动修复失效隧道)"
+            _success "守护进程已启用！(每 2 分钟检查并自动修复失效隧道)"
         else
             _warning "添加 Crontab 失败，守护进程未生效。"
         fi
@@ -2058,8 +1717,8 @@ _uninstall() {
 
     # 5. 清理组件脚本与别名 (双重清理，防止目录合并后的物理残留)
     _info "正在清理周边环境..."
-    rm -f "${SINGBOX_DIR}/parser.sh" "${SINGBOX_DIR}/advanced_relay.sh" "${SINGBOX_DIR}/xray_manager.sh"
-    rm -f "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh"
+    rm -f "${SINGBOX_DIR}/lib_common.sh" "${SINGBOX_DIR}/parser.sh" "${SINGBOX_DIR}/advanced_relay.sh" "${SINGBOX_DIR}/xray_manager.sh"
+    rm -f "${SCRIPT_DIR}/lib_common.sh" "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh"
     rm -f "/usr/local/bin/sb"
     
     # 5. 复原 MOTD
@@ -2283,12 +1942,18 @@ _check_and_fix_dns() {
     # 热修复：迁移 sing-box 1.14 已移除的旧 DNS 服务器格式，并清除有问题的自动网卡探测。
     if [ ! -f "$CONFIG_FILE" ]; then return; fi
     
-    local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
-    local has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
-    local has_legacy_dns=$(jq 'any(.dns.servers[]?; type == "string" or (type == "object" and has("address")))' "$CONFIG_FILE" 2>/dev/null)
-    local has_legacy_dns_rule=$(jq 'any(.dns.rules[]?; type == "object" and has("outbound"))' "$CONFIG_FILE" 2>/dev/null)
-    local has_independent_cache=$(jq '.dns.independent_cache != null' "$CONFIG_FILE" 2>/dev/null)
-    local has_default_resolver=$(jq '.route.default_domain_resolver == "dns-cloudflare"' "$CONFIG_FILE" 2>/dev/null)
+    # [资源优化] 一次 jq 调用取回全部判定标志 (原先 6 次进程启动)
+    local _dns_flags
+    _dns_flags=$(jq -r '[
+            has("dns"),
+            (try .route.auto_detect_interface catch false),
+            any(.dns.servers[]?; type == "string" or (type == "object" and has("address"))),
+            any(.dns.rules[]?; type == "object" and has("outbound")),
+            (.dns.independent_cache != null),
+            (.route.default_domain_resolver == "dns-cloudflare")
+        ] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+    local has_dns has_auto_detect has_legacy_dns has_legacy_dns_rule has_independent_cache has_default_resolver
+    IFS=$'\t' read -r has_dns has_auto_detect has_legacy_dns has_legacy_dns_rule has_independent_cache has_default_resolver <<< "$_dns_flags"
     local needs_restart=false
     
     if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || \
@@ -3931,10 +3596,9 @@ _view_nodes() {
         # 收集链接到临时文件
         [ -n "$url" ] && echo "$url" >> /tmp/singbox_links.tmp
 
-        # 同步打印 mihomo / Clash.Meta 单行节点 (从 clash.yaml 抽取对应 proxy 转 JSON)
-        if [ -n "$proxy_name_to_find" ] && [ -f "$YQ_BINARY" ] && [ -f "$CLASH_YAML_FILE" ]; then
-            export PROXY_NAME="$proxy_name_to_find"
-            local proxy_json_line=$(${YQ_BINARY} eval -o=json '.proxies[] | select(.name == env(PROXY_NAME))' "$CLASH_YAML_FILE" 2>/dev/null | jq -c . 2>/dev/null)
+        # 同步打印 mihomo / Clash.Meta 单行节点 (从预载缓存读取，无外部进程开销)
+        if [ -n "$proxy_name_to_find" ]; then
+            local proxy_json_line=$(_get_proxy_json_line "$proxy_name_to_find")
             if [ -n "$proxy_json_line" ] && [ "$proxy_json_line" != "null" ]; then
                 echo -e "  ${YELLOW}mihomo:${NC} - ${proxy_json_line}"
             fi
@@ -4358,18 +4022,22 @@ _modify_port() {
                         new_link=$(echo "$new_link" | sed -E 's/\?&/?/g; s/&$//g; s/\?$//g')
                     fi
                 fi
-                _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\""
-                _info "分享链接已同步更新。"
             fi
+
+            # [资源优化] 合并 share_link / portHopping / portHoppingMode 为单次原子修改 (3次→1次)
+            local meta_filter='.'
+            [ -n "$new_link" ] && meta_filter="${meta_filter} | .[\"$tag_to_modify\"].share_link = \"$new_link\""
             if [ -n "$hop_info" ]; then
                 if [ -n "$final_hop_info" ]; then
-                    _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".portHopping = \"$final_hop_info\"" || return
-                    if [ -n "$hop_mode" ]; then
-                        _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".portHoppingMode = \"$hop_mode\"" || return
-                    fi
+                    meta_filter="${meta_filter} | .[\"$tag_to_modify\"].portHopping = \"$final_hop_info\""
+                    [ -n "$hop_mode" ] && meta_filter="${meta_filter} | .[\"$tag_to_modify\"].portHoppingMode = \"$hop_mode\""
                 else
-                    _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_modify\".portHopping, .\"$tag_to_modify\".portHoppingMode)" || return
+                    meta_filter="${meta_filter} | del(.[\"$tag_to_modify\"].portHopping, .[\"$tag_to_modify\"].portHoppingMode)"
                 fi
+            fi
+            if [ "$meta_filter" != '.' ]; then
+                _atomic_modify_json "$METADATA_FILE" "$meta_filter" || return
+                [ -n "$new_link" ] && _info "分享链接已同步更新。"
             fi
         fi
     fi
@@ -4535,8 +4203,8 @@ _update_script() {
         return 1
     fi
     
-    # 需要更新的子脚本列表
-    local sub_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh")
+    # 需要更新的子脚本与共享库列表
+    local sub_scripts=("lib_common.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh")
     
     for script_name in "${sub_scripts[@]}"; do
         local updated=false
@@ -5065,16 +4733,25 @@ _main_menu() {
     # 检查当前定时任务状态
     local cron_status="未设置"
     local cron_time=""
-    
+
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         if [ -f "/etc/systemd/system/sing-box-restart.timer" ]; then
             cron_time=$(grep "OnCalendar" /etc/systemd/system/sing-box-restart.timer | cut -d' ' -f2 | cut -d: -f1,2)
             cron_status="已启用 (每天 ${cron_time} 重启 - Systemd)"
         fi
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        if [ -f "/etc/init.d/sing-box-timer" ] && rc-service sing-box-timer status &>/dev/null; then
+        # [优化] OpenRC 改用标准 cron 调度 (无常驻 sleep 循环)；兼容旧版 sing-box-timer 服务展示
+        local cron_line
+        cron_line=$(crontab -l 2>/dev/null | grep -F "# sing-box-daily-restart")
+        if [ -n "$cron_line" ]; then
+            local c_min c_hour
+            c_min=$(echo "$cron_line" | awk '{print $1}')
+            c_hour=$(echo "$cron_line" | awk '{print $2}')
+            cron_time=$(printf "%02d:%02d" "$((10#$c_hour))" "$((10#$c_min))")
+            cron_status="已启用 (每天 ${cron_time} 重启 - Cron)"
+        elif [ -f "/etc/init.d/sing-box-timer" ] && rc-service sing-box-timer status &>/dev/null; then
             cron_time=$(grep "RESTART_TIME=" /etc/init.d/sing-box-timer | cut -d'"' -f2)
-            cron_status="已启用 (每天 ${cron_time} 重启 - OpenRC)"
+            cron_status="已启用 (每天 ${cron_time} 重启 - OpenRC 旧服务)"
         fi
     fi
     
@@ -5139,28 +4816,19 @@ EOF
                 systemctl daemon-reload
                 systemctl enable --now sing-box-restart.timer
             elif [ "$INIT_SYSTEM" == "openrc" ]; then
-                # OpenRC 调度服务方案
-                cat > /usr/local/bin/sb-timer.sh <<EOF
-#!/bin/bash
-TARGET_TIME="\$1"
-while true; do
-    [ "\$(date +%H:%M)" == "\$TARGET_TIME" ] && rc-service sing-box restart && sleep 61
-    sleep 30
-done
-EOF
-                chmod +x /usr/local/bin/sb-timer.sh
-                cat > /etc/init.d/sing-box-timer <<EOF
-#!/sbin/openrc-run
-description="Sing-box Scheduled Restart Timer"
-command="/usr/local/bin/sb-timer.sh"
-command_args="${time_str}"
-pidfile="/run/sing-box-timer.pid"
-command_background=true
-RESTART_TIME="${time_str}"
-EOF
-                chmod +x /etc/init.d/sing-box-timer
-                rc-service sing-box-timer restart 2>/dev/null
-                rc-update add sing-box-timer default 2>/dev/null
+                # [资源优化] OpenRC 采用标准 cron 调度 (每天触发一次)，
+                # 彻底移除旧版 sb-timer.sh 的 while true; sleep 30 常驻进程。
+                # 确保 cron 守护进程运行
+                _pkg_install dcron >/dev/null 2>&1
+                command -v crond &>/dev/null && rc-service dcron start 2>/dev/null && rc-update add dcron default 2>/dev/null
+                # 清理遗留的旧版常驻服务
+                if [ -f "/etc/init.d/sing-box-timer" ]; then
+                    rc-service sing-box-timer stop 2>/dev/null
+                    rc-update del sing-box-timer default 2>/dev/null
+                    rm -f /etc/init.d/sing-box-timer /usr/local/bin/sb-timer.sh
+                fi
+                local cron_job="$((10#$min)) $((10#$hour)) * * * rc-service sing-box restart >/dev/null 2>&1 # sing-box-daily-restart"
+                (crontab -l 2>/dev/null | grep -vF "# sing-box-daily-restart"; echo "$cron_job") | crontab -
             fi
             
             _success "定时重启已通过 ${INIT_SYSTEM} 原生组件设置完成！"
@@ -5195,7 +4863,15 @@ EOF
             if [ "$INIT_SYSTEM" == "systemd" ]; then
                 systemctl list-timers sing-box-restart.timer --no-pager
             elif [ "$INIT_SYSTEM" == "openrc" ]; then
-                rc-service sing-box-timer status
+                local cron_line
+                cron_line=$(crontab -l 2>/dev/null | grep -F "# sing-box-daily-restart")
+                if [ -n "$cron_line" ]; then
+                    echo "  ${cron_line}"
+                elif [ -f "/etc/init.d/sing-box-timer" ]; then
+                    rc-service sing-box-timer status
+                else
+                    _info "未检测到定时任务。"
+                fi
             fi
             ;;
         3)
@@ -5210,9 +4886,14 @@ EOF
                         rm -f /etc/systemd/system/sing-box-restart.timer /etc/systemd/system/sing-box-restart.service
                         systemctl daemon-reload
                     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-                        rc-service sing-box-timer stop 2>/dev/null
-                        rc-update del sing-box-timer default 2>/dev/null
-                        rm -f /etc/init.d/sing-box-timer /usr/local/bin/sb-timer.sh
+                        # 清理 cron 任务
+                        crontab -l 2>/dev/null | grep -vF "# sing-box-daily-restart" | crontab -
+                        # 联动清理可能遗留的旧版服务
+                        if [ -f "/etc/init.d/sing-box-timer" ]; then
+                            rc-service sing-box-timer stop 2>/dev/null
+                            rc-update del sing-box-timer default 2>/dev/null
+                            rm -f /etc/init.d/sing-box-timer /usr/local/bin/sb-timer.sh
+                        fi
                     fi
                     _success "定时重启已取消，相关系统组件已清理。"
                 else

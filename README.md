@@ -354,3 +354,13 @@
 - **新增 Snell v5 协议**：适配 sing-box 1.14.0+ Snell 入站与 Mihomo v5 客户端，支持随机/自定义 PSK、UDP、连接复用和 HTTP 混淆，并支持单节点及批量创建。
 - **迁移 sing-box 1.14 DNS 配置**：新配置改用显式 HTTPS DNS 服务器格式；已有旧版 `address` 服务器、`outbound` DNS 规则和 `independent_cache` 会在启动脚本时自动备份并迁移。
 - **补齐默认域名解析器**：自动写入 `route.default_domain_resolver`，并移除已失效的废弃功能环境变量，使配置可直接通过 sing-box 1.14 检查。
+
+### 2026.09.09 (架构重构与低资源优化)
+- **抽取共享函数库 `lib_common.sh`**：统一管理颜色、编解码、公网 IP、入站 IP 白名单校验、原子读写、端口冲突检测、iptables 持久化和内存探测，消灭跨 `singbox.sh` / `advanced_relay.sh` / `xray_manager.sh` 的 600+ 行重复代码与行为分叉。
+- **大幅合并高频进程调用**：
+  - 启动自愈 `_check_and_fix_dns` 从 6 次独立 `jq` 判定合并为 1 次批量提取；
+  - `_view_nodes` 和 `_view_xray_nodes` 节点列表改为预载入内存字典 / 单次批量提取，消除每节点 5–7 次外部进程 fork；
+  - 修改端口 `_modify_port` 中的元数据更新与 Xray 元数据写入均合并为单次原子操作。
+- **OpenRC 定时重启架构升级**：移除旧版 `while true; sleep 30` 的常驻后台脚本（`sb-timer.sh`），统一接入标准 cron 定时任务，实现真正的零常驻零空转。
+- **Argo Watchdog 降频与加固**：巡检频率从每分钟降至每 2 分钟，加入 `grep` 快速路径（无节点时零开销跳过），并采用 `flock` 原子锁避免并发重叠。
+- **运维加固**：收窄 `cloudflared` 进程清理范围，避免误杀系统其他实例；统一 `advanced_relay.sh` 更新源至主仓库；加固 `_url_decode` 反斜杠处理。

@@ -2,36 +2,33 @@
 
 # 核心环境定义
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-SINGBOX_DIR="/usr/local/etc/sing-box"
-SINGBOX_BIN="/usr/local/bin/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+SINGBOX_BIN="${SINGBOX_BIN:-/usr/local/bin/sing-box}"
+GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/iamsxm/singbox-lite/main}"
 
-# [整合方案] 检测父进程导出的工具函数
-# 如果独立运行且函数缺失，可在此定义最简兜底逻辑 (可选)
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# 核心工具函数
-_url_encode() {
-    # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
-    printf '%s' "$1" | jq -sRr @uri
-}
-
-# 打印消息函数 (强制重定向到 stderr，防止干扰变量捕获)
-if ! declare -f _info >/dev/null; then
-    _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
-    _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
-    _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
-    _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
+# --- 加载共享函数库 lib_common.sh ---
+if [ -z "${_LIB_COMMON_SOURCED:-}" ]; then
+    _lib_common=""
+    for _d in "$SCRIPT_DIR" "$SINGBOX_DIR"; do
+        [ -f "${_d}/lib_common.sh" ] && { _lib_common="${_d}/lib_common.sh"; break; }
+    done
+    if [ -z "$_lib_common" ]; then
+        _lib_common="${SINGBOX_DIR}/lib_common.sh"
+        mkdir -p "$SINGBOX_DIR" 2>/dev/null
+        if ! { curl -fsSL --max-time 15 "${GITHUB_RAW_BASE}/lib_common.sh" -o "${_lib_common}.tmp" 2>/dev/null || wget -qO "${_lib_common}.tmp" "${GITHUB_RAW_BASE}/lib_common.sh" 2>/dev/null; } || [ ! -s "${_lib_common}.tmp" ]; then
+            rm -f "${_lib_common}.tmp"
+            echo "[错误] 缺少共享函数库 lib_common.sh 且自动下载失败。" >&2
+            exit 1
+        fi
+        mv -f "${_lib_common}.tmp" "$_lib_common"
+        . "$_lib_common"
+    else
+        . "$_lib_common"
+    fi
 fi
 
 # --- 全局变量 ---
-# 工具路径
-YQ_BINARY="/usr/local/bin/yq"
+YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
 
 # 配置文件路径
 MAIN_CONFIG_FILE="${SINGBOX_DIR}/config.json"
@@ -40,111 +37,10 @@ RELAY_AUX_DIR="${SINGBOX_DIR}"
 RELAY_CLASH_YAML="${RELAY_AUX_DIR}/clash.yaml"
 RELAY_CONFIG_FILE="${RELAY_AUX_DIR}/relay.json"
 
-# [修复] 独立定义 _install_yq，确保子脚本可独立运行
-_install_yq() {
-    if ! command -v yq &>/dev/null; then
-        _info "安装 yq..."
-        local arch=$(uname -m)
-        case $arch in x86_64|amd64) arch='amd64' ;; aarch64|arm64) arch='arm64' ;; *) arch='amd64' ;; esac
-        wget -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch"
-        chmod +x "$YQ_BINARY"
-    fi
-}
-
-# 核心环境检测 (与主脚本 singbox.sh 保持一致)
-_detect_init_system() {
-    if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then
-        INIT_SYSTEM="openrc"
-    elif command -v systemctl &>/dev/null; then
-        INIT_SYSTEM="systemd"
-    else
-        INIT_SYSTEM="unknown"
-    fi
-}
-[ -z "$INIT_SYSTEM" ] && _detect_init_system
-
-# 公网 IP 获取 (带全局缓存)
-server_ip=""
-_get_public_ip() {
-    [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
-    local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
-    [ -z "$ip" ] && ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s6 --max-time 2 ipinfo.io/ip 2>/dev/null)
-    server_ip="$ip"
-    echo "$ip"
-}
-
-# 端口冲突检测 (与主脚本 singbox.sh 保持一致，区分 TCP/UDP)
-_check_port_occupied() {
-    local port=$1
-    local proto=${2:-tcp}
-    if [[ "$proto" == "tcp" ]]; then
-        if command -v ss &>/dev/null; then
-            ss -lnpt | grep -q ":${port} " && return 0
-        else
-            netstat -lnpt | grep -q ":${port} " && return 0
-        fi
-    else
-        if command -v ss &>/dev/null; then
-            ss -lnpu | grep -q ":${port} " && return 0
-        else
-            netstat -lnpu | grep -q ":${port} " && return 0
-        fi
-    fi
-    return 1
-}
-
-# IPTables 规则保存
-_save_iptables_rules() {
-    _info "正在保存 IPTables 规则..."
-    if command -v netfilter-persistent &>/dev/null; then
-        # Debian/Ubuntu: 使用 netfilter-persistent 统一持久化 (含 v4+v6)
-        netfilter-persistent save >/dev/null 2>&1
-    else
-        # Alpine / 通用方案: 分别保存 v4 和 v6 规则到标准路径
-        if command -v iptables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        fi
-        if command -v ip6tables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-        fi
-    fi
-    # Alpine OpenRC: 尝试使用 rc-service 保存
-    if command -v rc-service &>/dev/null; then
-        rc-service iptables save 2>/dev/null
-        rc-service ip6tables save 2>/dev/null
-    fi
-}
-
-# 原子修改 JSON (与主脚本 singbox.sh 保持一致，不静默吞掉 jq 错误)
-_atomic_modify_json() {
-    local file="$1" filter="$2"
-    [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp"
-    if jq "$filter" "$file" > "$tmp"; then mv "$tmp" "$file"
-    else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
-}
-
-# 单个原子修改 YAML
-_atomic_modify_yaml() {
-    local file="$1" filter="$2"
-    [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp"
-    cp "$file" "$tmp"
-    if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then
-        rm "$tmp"
-    else
-        _error "修改 YAML 失败: $file"; mv "$tmp" "$file"; return 1
-    fi
-}
-
 # 服务管理
 _manage_service() {
     local action="$1"
-    # 中转脚本可能使用独立服务或主服务，此处保持与主脚本一致的逻辑
     local service_pkg="sing-box"
-    # 如果检测到中转专用服务文件，则使用单机中转模式
     [ -f "/etc/systemd/system/sing-box-relay.service" ] && service_pkg="sing-box-relay"
 
     _info "执行服务操作: $action ($service_pkg)..."

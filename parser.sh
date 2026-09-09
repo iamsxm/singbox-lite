@@ -4,9 +4,10 @@
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 
-# [整合方案] 解析器核心解码函数 (独立实现，不依赖外部)
+# [整合方案] 解析器核心解码函数 (加固：保护反斜杠字面量，与 lib_common.sh 行为对齐)
 _url_decode() {
     local data="${1//+/ }"
+    data="${data//\\/\\\\}"
     printf '%b' "${data//%/\\x}"
 }
 

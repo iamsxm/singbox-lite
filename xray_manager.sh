@@ -3,7 +3,7 @@
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.0.0"
+XRAY_SCRIPT_VERSION="3.1.0"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -16,146 +16,31 @@ XRAY_METADATA="${XRAY_DIR}/metadata.json"
 SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
 CLASH_YAML_FILE="${CLASH_YAML_FILE:-${SINGBOX_DIR}/clash.yaml}"
 YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
+GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/iamsxm/singbox-lite/main}"
 
-# --- 颜色定义 ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# --- 打印函数 (如未从父进程继承则定义本地版本) ---
-if ! declare -f _info >/dev/null 2>&1; then
-    _info()    { echo -e "${CYAN}[信息] $1${NC}" >&2; }
-    _error()   { echo -e "${RED}[错误] $1${NC}" >&2; }
-    _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
-    _warn()    { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
-    _warning() { _warn "$1"; }
-fi
-
-# --- URL 编码 ---
-if ! declare -f _url_encode >/dev/null 2>&1; then
-    _url_encode() {
-        printf '%s' "$1" | jq -sRr @uri
-    }
-fi
-
-if ! declare -f _release_install_cache >/dev/null 2>&1; then
-    _release_install_cache() {
-        sync 2>/dev/null || true
-        if [ -w /proc/sys/vm/drop_caches ]; then
-            if { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null; then
-                _info "已尝试释放安装产生的文件缓存。"
-            fi
+# --- 加载共享函数库 lib_common.sh ---
+if [ -z "${_LIB_COMMON_SOURCED:-}" ]; then
+    _lib_common=""
+    for _d in "$SCRIPT_DIR" "$SINGBOX_DIR"; do
+        [ -f "${_d}/lib_common.sh" ] && { _lib_common="${_d}/lib_common.sh"; break; }
+    done
+    if [ -z "$_lib_common" ]; then
+        _lib_common="${SINGBOX_DIR}/lib_common.sh"
+        mkdir -p "$SINGBOX_DIR" 2>/dev/null
+        if ! { curl -fsSL --max-time 15 "${GITHUB_RAW_BASE}/lib_common.sh" -o "${_lib_common}.tmp" 2>/dev/null || wget -qO "${_lib_common}.tmp" "${GITHUB_RAW_BASE}/lib_common.sh" 2>/dev/null; } || [ ! -s "${_lib_common}.tmp" ]; then
+            rm -f "${_lib_common}.tmp"
+            echo "[错误] 缺少共享函数库 lib_common.sh 且自动下载失败。" >&2
+            exit 1
         fi
-        return 0
-    }
-fi
-
-if ! declare -f _ss_base64_encode >/dev/null 2>&1; then
-    _ss_base64_encode() {
-        # SS 标准 Base64 (无 Padding)
-        printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
-    }
-fi
-# --- 环境检测 ---
-if ! declare -f _detect_init_system >/dev/null 2>&1; then
-    _detect_init_system() {
-        if [ -f /sbin/openrc-run ] || command -v rc-service >/dev/null; then
-            INIT_SYSTEM="openrc"
-        elif command -v systemctl >/dev/null; then
-            INIT_SYSTEM="systemd"
-        else
-            INIT_SYSTEM="unknown"
-        fi
-    }
+        mv -f "${_lib_common}.tmp" "$_lib_common"
+        . "$_lib_common"
+    else
+        . "$_lib_common"
+    fi
 fi
 [ -z "$INIT_SYSTEM" ] && _detect_init_system
 
-# --- 包管理 ---
-if ! declare -f _pkg_install >/dev/null 2>&1; then
-    _pkg_install() {
-        local pkgs="$*"
-        [ -z "$pkgs" ] && return 0
-        if command -v apk >/dev/null; then
-            apk add --no-cache $pkgs >/dev/null 2>&1
-        elif command -v apt-get >/dev/null; then
-            if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
-                apt-get update -qq >/dev/null 2>&1
-            fi
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-                apt-get update -qq >/dev/null 2>&1
-                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
-            }
-        elif command -v yum >/dev/null; then yum install -y $pkgs >/dev/null 2>&1
-        elif command -v dnf >/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
-        fi
-    }
-fi
-
-# --- 原子 JSON 修改 ---
-if ! declare -f _atomic_modify_json >/dev/null 2>&1; then
-    _atomic_modify_json() {
-        local file="$1" filter="$2"
-        [ ! -f "$file" ] && return 1
-        local tmp="${file}.tmp"
-        if jq "$filter" "$file" > "$tmp"; then mv "$tmp" "$file"
-        else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
-    }
-fi
-
-# --- 原子 YAML 修改 ---
-if ! declare -f _atomic_modify_yaml >/dev/null 2>&1; then
-    _atomic_modify_yaml() {
-        local file="$1" filter="$2"
-        [ ! -f "$file" ] && return 1
-        cp "$file" "${file}.tmp"
-        if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then rm "${file}.tmp"
-        else _error "修改YAML失败: $file"; mv "${file}.tmp" "$file"; return 1; fi
-    }
-fi
-
-# --- Clash YAML 节点操作 ---
-if ! declare -f _add_node_to_yaml >/dev/null 2>&1; then
-    _add_node_to_yaml() {
-        local proxy_json="$1"
-        local name=$(echo "$proxy_json" | jq -r '.name')
-        local yaml_entry=$(echo "$proxy_json" | ${YQ_BINARY} -P '.')
-        echo "$yaml_entry" | ${YQ_BINARY} eval -i ".proxies += [load(\"/dev/stdin\")]" "$CLASH_YAML_FILE" 2>/dev/null || \
-        ${YQ_BINARY} eval -i ".proxies += [$(echo "$proxy_json" | ${YQ_BINARY} -P '.')]" "$CLASH_YAML_FILE" 2>/dev/null
-        export NODE_NAME="$name"
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[] | select(.name == "节点选择") | .proxies) += [env(NODE_NAME)]'
-    }
-fi
-
-if ! declare -f _remove_node_from_yaml >/dev/null 2>&1; then
-    _remove_node_from_yaml() {
-        local name="$1"
-        export DEL_NAME="$name"
-        _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(DEL_NAME)))'
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[].proxies) -= [env(DEL_NAME)]'
-    }
-fi
-
-if ! declare -f _find_proxy_name >/dev/null 2>&1; then
-    _find_proxy_name() {
-        local port="$1" type="$2"
-        ${YQ_BINARY} eval ".proxies[] | select(.port == ${port}) | .name" "$CLASH_YAML_FILE" 2>/dev/null | head -1
-    }
-fi
-
 # --- 端口冲突检测 (跨双核心) ---
-_check_port_occupied() {
-    local port="$1"
-    if command -v ss &>/dev/null; then
-        ss -tlnp 2>/dev/null | grep -q ":${port} " && return 0
-        ss -ulnp 2>/dev/null | grep -q ":${port} " && return 0
-    elif command -v netstat &>/dev/null; then
-        netstat -tlnp 2>/dev/null | grep -q ":${port} " && return 0
-    fi
-    return 1
-}
-
 _check_xray_port_conflict() {
     local port="$1" protocol="${2:-tcp}"
     # 检查系统端口
@@ -177,113 +62,10 @@ _check_xray_port_conflict() {
     return 1
 }
 
-# --- 公网 IP 获取 ---
-if ! declare -f _get_public_ip >/dev/null 2>&1; then
-    _get_public_ip() {
-        [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
-        local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
-        [ -z "$ip" ] && ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null)
-        server_ip="$ip"
-        echo "$ip"
-    }
-fi
-
-# ---------------- 入站来源 IP 白名单 ----------------
-_validate_xray_ipv6_part() {
-    local part="$1"
-    [ -z "$part" ] && return 0
-    [[ "$part" != :* && "$part" != *: ]] || return 1
-    local hextets=()
-    IFS=':' read -r -a hextets <<< "$part"
-    [ "${#hextets[@]}" -gt 0 ] || return 1
-    local hextet
-    for hextet in "${hextets[@]}"; do
-        [[ "$hextet" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
-    done
-}
-
-_normalize_xray_inbound_ip() {
-    local value="$1" address="" prefix=""
-    value="${value#[}"
-    value="${value%]}"
-    if [[ "$value" == */* ]]; then
-        address="${value%%/*}"
-        prefix="${value#*/}"
-        [[ "$prefix" != */* ]] || return 1
-    else
-        address="$value"
-    fi
-
-    if [[ "$address" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-        local octets=()
-        IFS='.' read -r -a octets <<< "$address"
-        [ "${#octets[@]}" -eq 4 ] || return 1
-        local octet
-        for octet in "${octets[@]}"; do
-            [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
-            [ "$((10#$octet))" -le 255 ] || return 1
-        done
-        [ -z "$prefix" ] && prefix=32
-        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
-        [ "$((10#$prefix))" -le 32 ] || return 1
-        printf '%d.%d.%d.%d/%d' "$((10#${octets[0]}))" "$((10#${octets[1]}))" "$((10#${octets[2]}))" "$((10#${octets[3]}))" "$((10#$prefix))"
-        return 0
-    fi
-
-    [[ "$address" == *:* ]] || return 1
-    [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
-    [ -z "$prefix" ] && prefix=128
-    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
-    [ "$((10#$prefix))" -le 128 ] || return 1
-
-    local left="" right="" left_count=0 right_count=0 total=0
-    if [[ "$address" == *::* ]]; then
-        [[ "${address#*::}" != *::* ]] || return 1
-        left="${address%%::*}"
-        right="${address#*::}"
-        _validate_xray_ipv6_part "$left" || return 1
-        _validate_xray_ipv6_part "$right" || return 1
-        [ -n "$left" ] && left_count=$(awk -F: '{print NF}' <<< "$left")
-        [ -n "$right" ] && right_count=$(awk -F: '{print NF}' <<< "$right")
-        total=$((left_count + right_count))
-        [ "$total" -le 7 ] || return 1
-    else
-        _validate_xray_ipv6_part "$address" || return 1
-        total=$(awk -F: '{print NF}' <<< "$address")
-        [ "$total" -eq 8 ] || return 1
-    fi
-    printf '%s/%d' "$address" "$((10#$prefix))"
-}
-
-_normalize_xray_inbound_ip_list() {
-    local raw="${1//,/ }" compact="${1//,/ }"
-    compact="${compact//[[:space:]]/}"
-    [ -n "$compact" ] || return 0
-    local values=()
-    read -r -a values <<< "$raw"
-    [ "${#values[@]}" -gt 0 ] || return 1
-    local value normalized result=()
-    for value in "${values[@]}"; do
-        normalized=$(_normalize_xray_inbound_ip "$value") || return 1
-        result+=("$normalized")
-    done
-    local IFS=' '
-    printf '%s' "${result[*]}"
-}
-
+# ---------------- 入站来源 IP 白名单 (校验函数使用 lib_common.sh 的通用规范化) ----------------
 _prompt_xray_allowed_inbound_ips() {
-    XRAY_ALLOWED_INBOUND_IPS=""
-    local raw="" normalized=""
-    while true; do
-        read -p "允许的入站来源 IP/CIDR（多个用逗号或空格分隔，留空不限）: " raw
-        normalized=$(_normalize_xray_inbound_ip_list "$raw")
-        if [ $? -eq 0 ]; then
-            XRAY_ALLOWED_INBOUND_IPS="$normalized"
-            [ -n "$normalized" ] && _info "已启用入站来源 IP 白名单: ${normalized// /, }"
-            return 0
-        fi
-        _error "IP/CIDR 格式无效，请重新输入。例如: 203.0.113.10, 2001:db8::/32"
-    done
+    _prompt_allowed_inbound_ips
+    XRAY_ALLOWED_INBOUND_IPS="$ALLOWED_INBOUND_IPS"
 }
 
 _apply_xray_inbound_ip_policy() {
@@ -648,27 +430,21 @@ _input_port() {
 }
 
 # 保存分享链接到元数据 (参数: tag name link [key1=val1 key2=val2 ...])
+# [资源优化] 合并基础属性与可变键值对，单次 jq 完成 (原先每对属性单独启动一次 jq)
 _save_xray_meta() {
     local tag="$1" name="$2" link="$3"
     shift 3
-    
-    # 先构建基础 JSON
+
+    local pairs_json="{}"
+    if [ $# -gt 0 ]; then
+        local pairs=("$@")
+        pairs_json=$(printf '%s\n' "${pairs[@]}" | jq -R 'select(length > 0) | split("=") | {(.[0]): (.[1:] | join("="))}' | jq -s 'add // {}')
+    fi
+
     local tmp="${XRAY_METADATA}.tmp.$$"
-    jq --arg t "$tag" --arg n "$name" --arg l "$link" \
-        '. + {($t): {name: $n, share_link: $l}}' "$XRAY_METADATA" > "$tmp" 2>/dev/null && \
+    jq --arg t "$tag" --arg n "$name" --arg l "$link" --argjson extra "$pairs_json" \
+        '.[$t] = ((.[$t] // {}) + {name: $n, share_link: $l} + $extra)' "$XRAY_METADATA" > "$tmp" 2>/dev/null && \
         mv "$tmp" "$XRAY_METADATA" || { rm -f "$tmp"; return 1; }
-    
-    # 追加额外的键值对
-    for pair in "$@"; do
-        local key="${pair%%=*}"
-        local val="${pair#*=}"
-        if [ -n "$key" ] && [ -n "$val" ]; then
-            local tmp2="${XRAY_METADATA}.tmp.$$"
-            jq --arg t "$tag" --arg k "$key" --arg v "$val" \
-                '.[$t][$k] = $v' "$XRAY_METADATA" > "$tmp2" 2>/dev/null && \
-                mv "$tmp2" "$XRAY_METADATA" || rm -f "$tmp2"
-        fi
-    done
 }
 
 # ============================================================
@@ -1236,25 +1012,34 @@ _view_xray_nodes() {
     echo ""
     echo -e "${YELLOW}══════════════════ Xray 节点列表 ══════════════════${NC}"
     local count=0
-    local tags=$(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null)
-    for tag in $tags; do
+
+    # [资源优化] 一次性提取全部节点的配置与元数据，消除循环内反复 jq 调用 (原先每节点 6-7 次)
+    local meta_path="$XRAY_METADATA"
+    [ -f "$meta_path" ] || meta_path="/dev/null"
+    while IFS=$'\t' read -r tag protocol port network security name link allowed_inbound_ips; do
+        [ -n "$tag" ] || continue
         count=$((count + 1))
-        local protocol=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .protocol" "$XRAY_CONFIG")
-        local port=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .port" "$XRAY_CONFIG")
-        local network=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .streamSettings.network // \"tcp\"" "$XRAY_CONFIG")
-        local security=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .streamSettings.security // \"none\"" "$XRAY_CONFIG")
-        local name=$(jq -r ".\"$tag\".name // \"$tag\"" "$XRAY_METADATA" 2>/dev/null)
-        local link=$(jq -r ".\"$tag\".share_link // empty" "$XRAY_METADATA" 2>/dev/null)
-        local allowed_inbound_ips=$(jq -r --arg t "$tag" '.[$t].allowedInboundIPs // [] | join(", ")' "$XRAY_METADATA" 2>/dev/null)
         local desc="${protocol}"
-        [ "$network" != "null" ] && [ "$network" != "tcp" ] && desc="${desc}+${network}"
-        [ "$security" != "null" ] && [ "$security" != "none" ] && desc="${desc}+${security}"
+        [ "$network" != "null" ] && [ -n "$network" ] && [ "$network" != "tcp" ] && desc="${desc}+${network}"
+        [ "$security" != "null" ] && [ -n "$security" ] && [ "$security" != "none" ] && desc="${desc}+${security}"
         echo ""
         echo -e "  ${GREEN}[${count}]${NC} ${CYAN}${name}${NC}"
         echo -e "      协议: ${YELLOW}${desc}${NC}  |  端口: ${GREEN}${port}${NC}  |  标签: ${CYAN}${tag}${NC}"
         [ -n "$allowed_inbound_ips" ] && echo -e "      入站来源白名单: ${YELLOW}${allowed_inbound_ips}${NC}"
         [ -n "$link" ] && echo -e "      ${YELLOW}分享链接:${NC} ${link}"
-    done
+    done < <(jq -r --slurpfile meta "$meta_path" '
+        ($meta[0] // {}) as $m |
+        .inbounds[] | [
+            .tag,
+            .protocol,
+            (.port|tostring),
+            (.streamSettings.network // "tcp"),
+            (.streamSettings.security // "none"),
+            ($m[.tag].name // .tag),
+            ($m[.tag].share_link // ""),
+            (($m[.tag].allowedInboundIPs // []) | join(", "))
+        ] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
+
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
     echo -e "  共 ${GREEN}${count}${NC} 个 Xray 节点"
