@@ -509,11 +509,26 @@ _install_sing_box() {
 
         _release_install_cache
         _info "检测到低内存环境 ($(_get_total_mem_mb)MiB)，正在流式下载并单次提取 sing-box 二进制文件..."
-        wget -qO - "$download_url" | tar -xzOf - "$archive_member" > "$staging_bin"
-        local stream_status=("${PIPESTATUS[@]}")
-        if [ "${stream_status[1]}" -ne 0 ] || [ ! -s "$staging_bin" ]; then
+        # curl 对 GitHub 重定向和连接中断的诊断更明确；每次重试都从头建立新的
+        # gzip 流，不能在同一条已截断的 tar 流上续传。
+        local attempt curl_status tar_status
+        curl_status=1
+        tar_status=1
+        for attempt in 1 2 3; do
+            [ "$attempt" -gt 1 ] && _warn "流式下载未完成，正在重试 (${attempt}/3)..."
             rm -f "$staging_bin"
-            _error "流式下载或解压 sing-box 二进制文件失败。"
+            curl -fL --connect-timeout 15 --max-time 600 --output - "$download_url" 2>/dev/null | \
+                tar -xzOf - "$archive_member" > "$staging_bin"
+            local stream_status=("${PIPESTATUS[@]}")
+            curl_status="${stream_status[0]:-1}"
+            tar_status="${stream_status[1]:-1}"
+            if [ "$curl_status" -eq 0 ] && [ "$tar_status" -eq 0 ] && [ -s "$staging_bin" ]; then
+                break
+            fi
+        done
+        if [ "$curl_status" -ne 0 ] || [ "$tar_status" -ne 0 ] || [ ! -s "$staging_bin" ]; then
+            rm -f "$staging_bin"
+            _error "流式下载或解压 sing-box 二进制文件失败（下载状态: ${curl_status}，解压状态: ${tar_status}）。"
             if [ "$service_stopped" = "true" ]; then
                 _warn "正在恢复原有 sing-box 服务..."
                 _manage_service start || _warn "原有 sing-box 服务恢复失败，请手动执行启动。"
