@@ -451,6 +451,9 @@ _install_sing_box() {
     local archive_path=""
     local extracted_bin=""
     local archive_member=""
+    local install_dir=""
+    local staging_bin=""
+    local service_stopped="false"
     case $arch in
         x86_64|amd64) arch_tag='amd64' ;;
         aarch64|arm64) arch_tag='arm64' ;;
@@ -470,6 +473,67 @@ _install_sing_box() {
     local download_url=$(curl -fsSL "$api_url" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
 
     if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; return 1; fi
+
+    # 64M 等低内存容器中，"下载到文件 -> tar 列表扫描 -> tar 解压" 会同时留下
+    # 压缩包、解压输出和两次解压的页缓存，极易触发 cgroup OOM。发布包目录名与
+    # 资源文件名一致，因此可从 URL 推导出二进制成员并用流式方式只处理一次。
+    if _is_low_mem_env; then
+        local archive_name="${download_url%%\?*}"
+        archive_name="${archive_name##*/}"
+        local package_dir="${archive_name%.tar.gz}"
+        archive_member="${package_dir}/sing-box"
+        install_dir="$(dirname "$SINGBOX_BIN")"
+        staging_bin="${SINGBOX_BIN}.install.$$"
+
+        if [ "$archive_name" = "$package_dir" ] || [ -e "$staging_bin" ]; then
+            _error "无法创建低内存安装暂存文件: $staging_bin"
+            return 1
+        fi
+        mkdir -p "$install_dir" || {
+            _error "创建安装目录失败: $install_dir"
+            return 1
+        }
+
+        # 更新时先停止旧核心，避免旧核心 RSS 与 tar/wget 同时占用 64M 限额。
+        if [ -x "$SINGBOX_BIN" ]; then
+            if { [ "$INIT_SYSTEM" = "systemd" ] && systemctl is-active --quiet sing-box; } || \
+               { [ "$INIT_SYSTEM" = "openrc" ] && rc-service sing-box status >/dev/null 2>&1; }; then
+                _warn "检测到低内存环境，安装期间暂时停止正在运行的 sing-box。"
+                if ! _manage_service stop; then
+                    _error "无法停止正在运行的 sing-box，为避免内存不足已取消更新。"
+                    return 1
+                fi
+                service_stopped="true"
+            fi
+        fi
+
+        _release_install_cache
+        _info "检测到低内存环境 ($(_get_total_mem_mb)MiB)，正在流式下载并单次提取 sing-box 二进制文件..."
+        wget -qO - "$download_url" | tar -xzOf - "$archive_member" > "$staging_bin"
+        local stream_status=("${PIPESTATUS[@]}")
+        if [ "${stream_status[1]}" -ne 0 ] || [ ! -s "$staging_bin" ]; then
+            rm -f "$staging_bin"
+            _error "流式下载或解压 sing-box 二进制文件失败。"
+            if [ "$service_stopped" = "true" ]; then
+                _warn "正在恢复原有 sing-box 服务..."
+                _manage_service start || _warn "原有 sing-box 服务恢复失败，请手动执行启动。"
+            fi
+            return 1
+        fi
+        if ! chmod +x "$staging_bin" || ! mv -f "$staging_bin" "$SINGBOX_BIN"; then
+            rm -f "$staging_bin"
+            _error "安装 sing-box 二进制文件失败: $SINGBOX_BIN"
+            if [ "$service_stopped" = "true" ]; then
+                _warn "正在恢复原有 sing-box 服务..."
+                _manage_service start || _warn "原有 sing-box 服务恢复失败，请手动执行启动。"
+            fi
+            return 1
+        fi
+
+        _release_install_cache
+        _success "sing-box 安装成功: ${SINGBOX_BIN}"
+        return 0
+    fi
 
     temp_dir=$(mktemp -d /root/.singbox-install.XXXXXX) || { _error "创建临时目录失败。"; return 1; }
     archive_path="${temp_dir}/sing-box.tar.gz"
